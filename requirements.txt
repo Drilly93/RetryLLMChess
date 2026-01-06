@@ -4,3 +4,4 @@ torch>=2.0.0
 python-chess>=1.999
 huggingface-hub>=0.20.0
 datasets>=2.14.0
+pandas>=2.0.0

@@ -5,19 +5,25 @@ This Gradio app provides:
 1. Interactive demo to test models
 2. Leaderboard of submitted models
 3. Live game visualization
+
+Leaderboard data is stored in a private HuggingFace dataset for persistence.
 """
 
-import json
+import io
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import gradio as gr
+import pandas as pd
 
 # Configuration
-ORGANIZATION = os.environ.get("HF_ORGANIZATION", "your-org-name")
-LEADERBOARD_FILE = "leaderboard.json"
+ORGANIZATION = os.environ.get("HF_ORGANIZATION", "LLM-course")
+LEADERBOARD_DATASET = os.environ.get("LEADERBOARD_DATASET", f"{ORGANIZATION}/chess-challenge-leaderboard")
+LEADERBOARD_FILENAME = "leaderboard.csv"
+HF_TOKEN = os.environ.get("HF_TOKEN")  # Required for private dataset access
+
 STOCKFISH_LEVELS = {
     "Beginner (Level 0)": 0,
     "Easy (Level 1)": 1,
@@ -25,19 +31,76 @@ STOCKFISH_LEVELS = {
     "Hard (Level 5)": 5,
 }
 
+# CSV columns for the leaderboard
+LEADERBOARD_COLUMNS = [
+    "model_id",
+    "legal_rate",
+    "legal_rate_first_try",
+    "elo",
+    "win_rate",
+    "draw_rate",
+    "games_played",
+    "last_updated",
+]
+
 
 def load_leaderboard() -> list:
-    """Load leaderboard from file or return empty list."""
-    if Path(LEADERBOARD_FILE).exists():
-        with open(LEADERBOARD_FILE, "r") as f:
-            return json.load(f)
-    return []
+    """Load leaderboard from private HuggingFace dataset."""
+    try:
+        from huggingface_hub import hf_hub_download
+        
+        # Download the CSV file from the dataset
+        csv_path = hf_hub_download(
+            repo_id=LEADERBOARD_DATASET,
+            filename=LEADERBOARD_FILENAME,
+            repo_type="dataset",
+            token=HF_TOKEN,
+        )
+        
+        df = pd.read_csv(csv_path)
+        return df.to_dict(orient="records")
+    
+    except Exception as e:
+        print(f"Could not load leaderboard from dataset: {e}")
+        # Return empty list if dataset doesn't exist yet
+        return []
 
 
 def save_leaderboard(data: list):
-    """Save leaderboard to file."""
-    with open(LEADERBOARD_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    """Save leaderboard to private HuggingFace dataset."""
+    try:
+        from huggingface_hub import HfApi
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data, columns=LEADERBOARD_COLUMNS)
+        
+        # Fill missing columns with defaults
+        for col in LEADERBOARD_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+        
+        # Reorder columns
+        df = df[LEADERBOARD_COLUMNS]
+        
+        # Convert to CSV bytes
+        csv_buffer = io.BytesIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        
+        # Upload to HuggingFace dataset
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=csv_buffer,
+            path_in_repo=LEADERBOARD_FILENAME,
+            repo_id=LEADERBOARD_DATASET,
+            repo_type="dataset",
+            commit_message=f"Update leaderboard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+        print(f"Leaderboard saved to {LEADERBOARD_DATASET}")
+        
+    except Exception as e:
+        print(f"Error saving leaderboard to dataset: {e}")
+        raise
 
 
 def get_available_models() -> list:
@@ -264,7 +327,7 @@ def evaluate_legal_moves(
         progress(1.0, desc="Done!")
         
         return f"""
-## ✅ Legal Move Evaluation for {model_id.split('/')[-1]}
+## Legal Move Evaluation for {model_id.split('/')[-1]}
 
 | Metric | Value |
 |--------|-------|
@@ -280,7 +343,7 @@ def evaluate_legal_moves(
 """
         
     except Exception as e:
-        return f"❌ Evaluation failed: {str(e)}"
+        return f"Evaluation failed: {str(e)}"
 
 
 def evaluate_winrate(
@@ -328,7 +391,7 @@ def evaluate_winrate(
         progress(1.0, desc="Done!")
         
         return f"""
-## 🏆 Win Rate Evaluation for {model_id.split('/')[-1]}
+## Win Rate Evaluation for {model_id.split('/')[-1]}
 
 | Metric | Value |
 |--------|-------|
@@ -343,7 +406,7 @@ Games played: {n_games} against Stockfish {stockfish_level}
 """
         
     except Exception as e:
-        return f"❌ Evaluation failed: {str(e)}"
+        return f"Evaluation failed: {str(e)}"
 
 
 def evaluate_model(
@@ -411,7 +474,7 @@ Games played: {n_games} against Stockfish {stockfish_level}
 """
         
     except Exception as e:
-        return f"❌ Evaluation failed: {str(e)}"
+        return f"Evaluation failed: {str(e)}"
 
 
 def refresh_leaderboard() -> str:
@@ -486,7 +549,7 @@ with gr.Blocks(
             )
         
         # Legal Move Evaluation Tab
-        with gr.TabItem("✅ Legal Move Eval"):
+        with gr.TabItem("Legal Move Eval"):
             gr.Markdown("""
             ### Phase 1: Legal Move Evaluation
             
@@ -551,7 +614,7 @@ with gr.Blocks(
                     label="Number of Games",
                 )
             
-            eval_btn = gr.Button("🏆 Run Win Rate Evaluation", variant="primary")
+            eval_btn = gr.Button("Run Win Rate Evaluation", variant="primary")
             eval_results = gr.Markdown()
             
             eval_btn.click(
@@ -561,7 +624,7 @@ with gr.Blocks(
             )
         
         # Submission Guide Tab
-        with gr.TabItem("📤 How to Submit"):
+        with gr.TabItem("How to Submit"):
             gr.Markdown(f"""
             ### Submitting Your Model
             
