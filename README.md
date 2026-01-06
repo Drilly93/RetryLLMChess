@@ -1,13 +1,34 @@
 ---
-title: Chess1MChallenge
-emoji: 🦀
-colorFrom: pink
-colorTo: gray
+title: Chess Challenge Arena
+emoji: ♟️
+colorFrom: gray
+colorTo: yellow
 sdk: gradio
-sdk_version: 6.2.0
+sdk_version: 4.44.0
 app_file: app.py
-pinned: false
-short_description: Train a 1M parameter LLM to play chess!
+pinned: true
+license: mit
 ---
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+# Chess Challenge Arena
+
+This Space hosts the evaluation arena for the LLM Chess Challenge.
+
+## Features
+
+- **Interactive Demo**: Test any submitted model against Stockfish
+- **Leaderboard**: See rankings of all submitted models
+- **Statistics**: View detailed performance metrics
+
+## How to Submit
+
+Students should push their trained models to this organization:
+
+```python
+from chess_challenge import ChessForCausalLM, ChessTokenizer
+
+model.push_to_hub("your-model-name", organization="LLM-course")
+tokenizer.push_to_hub("your-model-name", organization="LLM-course")
+```
+
+Models will be automatically evaluated and added to the leaderboard.

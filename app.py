@@ -1,0 +1,601 @@
+"""
+Chess Challenge Arena - Hugging Face Space
+
+This Gradio app provides:
+1. Interactive demo to test models
+2. Leaderboard of submitted models
+3. Live game visualization
+"""
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import gradio as gr
+
+# Configuration
+ORGANIZATION = os.environ.get("HF_ORGANIZATION", "your-org-name")
+LEADERBOARD_FILE = "leaderboard.json"
+STOCKFISH_LEVELS = {
+    "Beginner (Level 0)": 0,
+    "Easy (Level 1)": 1,
+    "Medium (Level 3)": 3,
+    "Hard (Level 5)": 5,
+}
+
+
+def load_leaderboard() -> list:
+    """Load leaderboard from file or return empty list."""
+    if Path(LEADERBOARD_FILE).exists():
+        with open(LEADERBOARD_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_leaderboard(data: list):
+    """Save leaderboard to file."""
+    with open(LEADERBOARD_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_available_models() -> list:
+    """Fetch available models from the organization."""
+    try:
+        from huggingface_hub import list_models
+        
+        models = list_models(author=ORGANIZATION)
+        return [m.id for m in models if "chess" in m.id.lower()]
+    except Exception as e:
+        print(f"Error fetching models: {e}")
+        return ["No models available"]
+
+
+def format_leaderboard_html(data: list) -> str:
+    """Format leaderboard data as HTML table."""
+    if not data:
+        return "<p>No models evaluated yet. Be the first to submit!</p>"
+    
+    # Sort by ELO
+    sorted_data = sorted(data, key=lambda x: x.get("elo", 0), reverse=True)
+    
+    html = """
+    <style>
+        .leaderboard-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .leaderboard-table th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px;
+            text-align: left;
+        }
+        .leaderboard-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #ddd;
+        }
+        .leaderboard-table tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        .leaderboard-table tr:hover {
+            background-color: #e9ecef;
+        }
+        .rank-1 { color: #ffd700; font-weight: bold; }
+        .rank-2 { color: #c0c0c0; font-weight: bold; }
+        .rank-3 { color: #cd7f32; font-weight: bold; }
+        .model-link { color: #667eea; text-decoration: none; }
+        .model-link:hover { text-decoration: underline; }
+        .legal-good { color: #28a745; }
+        .legal-medium { color: #ffc107; }
+        .legal-bad { color: #dc3545; }
+    </style>
+    <table class="leaderboard-table">
+        <thead>
+            <tr>
+                <th>Rank</th>
+                <th>Model</th>
+                <th>Legal Rate</th>
+                <th>ELO</th>
+                <th>Win Rate</th>
+                <th>Games</th>
+                <th>Last Updated</th>
+            </tr>
+        </thead>
+        <tbody>
+    """
+    
+    for i, entry in enumerate(sorted_data, 1):
+        rank_class = f"rank-{i}" if i <= 3 else ""
+        rank_display = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else str(i)
+        
+        model_url = f"https://huggingface.co/{entry['model_id']}"
+        
+        # Color code legal rate
+        legal_rate = entry.get('legal_rate', 0)
+        if legal_rate >= 0.9:
+            legal_class = "legal-good"
+        elif legal_rate >= 0.7:
+            legal_class = "legal-medium"
+        else:
+            legal_class = "legal-bad"
+        
+        html += f"""
+            <tr>
+                <td class="{rank_class}">{rank_display}</td>
+                <td><a href="{model_url}" target="_blank" class="model-link">{entry['model_id'].split('/')[-1]}</a></td>
+                <td class="{legal_class}">{legal_rate*100:.1f}%</td>
+                <td><strong>{entry.get('elo', 'N/A'):.0f}</strong></td>
+                <td>{entry.get('win_rate', 0)*100:.1f}%</td>
+                <td>{entry.get('games_played', 0)}</td>
+                <td>{entry.get('last_updated', 'N/A')}</td>
+            </tr>
+        """
+    
+    html += "</tbody></table>"
+    return html
+
+
+def render_board_svg(fen: str = "startpos") -> str:
+    """Render a chess board as SVG."""
+    try:
+        import chess
+        import chess.svg
+        
+        if fen == "startpos":
+            board = chess.Board()
+        else:
+            board = chess.Board(fen)
+        
+        return chess.svg.board(board, size=400)
+    except ImportError:
+        return "<p>Install python-chess to see the board</p>"
+
+
+def play_move(
+    model_id: str,
+    current_fen: str,
+    move_history: str,
+    temperature: float,
+) -> tuple:
+    """Play a move with the selected model."""
+    try:
+        import chess
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+        
+        # Load model
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+        model.eval()
+        
+        # Setup board
+        board = chess.Board(current_fen) if current_fen != "startpos" else chess.Board()
+        
+        # Tokenize history
+        if move_history:
+            inputs = tokenizer(move_history, return_tensors="pt")
+        else:
+            inputs = tokenizer(tokenizer.bos_token, return_tensors="pt")
+        
+        # Generate move
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits[:, -1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        
+        move_token = tokenizer.decode(next_token[0])
+        
+        # Parse move
+        if len(move_token) >= 6:
+            uci_move = move_token[2:4] + move_token[4:6]
+            try:
+                move = chess.Move.from_uci(uci_move)
+                if move in board.legal_moves:
+                    board.push(move)
+                    new_history = f"{move_history} {move_token}".strip()
+                    return (
+                        render_board_svg(board.fen()),
+                        board.fen(),
+                        new_history,
+                        f"Model played: {move_token} ({uci_move})",
+                    )
+            except:
+                pass
+        
+        return (
+            render_board_svg(current_fen if current_fen != "startpos" else None),
+            current_fen,
+            move_history,
+            f"⚠️ Model generated illegal move: {move_token}",
+        )
+        
+    except Exception as e:
+        return (
+            render_board_svg(),
+            "startpos",
+            "",
+            f"❌ Error: {str(e)}",
+        )
+
+
+def evaluate_legal_moves(
+    model_id: str,
+    n_positions: int,
+    progress: gr.Progress = gr.Progress(),
+) -> str:
+    """Evaluate a model's legal move generation."""
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        
+        from chess_challenge.evaluate import ChessEvaluator, load_model_from_hub
+        
+        progress(0, desc="Loading model...")
+        model, tokenizer = load_model_from_hub(model_id)
+        
+        progress(0.1, desc="Setting up evaluator...")
+        evaluator = ChessEvaluator(
+            model=model,
+            tokenizer=tokenizer,
+            stockfish_level=1,  # Not used for legal move eval
+        )
+        
+        progress(0.2, desc=f"Testing {n_positions} positions...")
+        results = evaluator.evaluate_legal_moves(n_positions=n_positions, verbose=False)
+        
+        # Update leaderboard
+        leaderboard = load_leaderboard()
+        entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
+        if entry is None:
+            entry = {"model_id": model_id}
+            leaderboard.append(entry)
+        
+        entry.update({
+            "legal_rate": results.get("legal_rate_with_retry", 0),
+            "legal_rate_first_try": results.get("legal_rate_first_try", 0),
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        
+        save_leaderboard(leaderboard)
+        progress(1.0, desc="Done!")
+        
+        return f"""
+## ✅ Legal Move Evaluation for {model_id.split('/')[-1]}
+
+| Metric | Value |
+|--------|-------|
+| **Positions Tested** | {results['total_positions']} |
+| **Legal (1st try)** | {results['legal_first_try']} ({results['legal_rate_first_try']*100:.1f}%) |
+| **Legal (with retries)** | {results['legal_first_try'] + results['legal_with_retry']} ({results['legal_rate_with_retry']*100:.1f}%) |
+| **Always Illegal** | {results['illegal_all_retries']} ({results['illegal_rate']*100:.1f}%) |
+
+### Interpretation
+- **>90% legal rate**: Great! Model has learned chess rules well.
+- **70-90% legal rate**: Decent, but room for improvement.
+- **<70% legal rate**: Model struggles with legal move generation.
+"""
+        
+    except Exception as e:
+        return f"❌ Evaluation failed: {str(e)}"
+
+
+def evaluate_winrate(
+    model_id: str,
+    stockfish_level: str,
+    n_games: int,
+    progress: gr.Progress = gr.Progress(),
+) -> str:
+    """Evaluate a model's win rate against Stockfish."""
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        
+        from chess_challenge.evaluate import ChessEvaluator, load_model_from_hub
+        
+        progress(0, desc="Loading model...")
+        model, tokenizer = load_model_from_hub(model_id)
+        
+        progress(0.1, desc="Setting up Stockfish...")
+        level = STOCKFISH_LEVELS.get(stockfish_level, 1)
+        evaluator = ChessEvaluator(
+            model=model,
+            tokenizer=tokenizer,
+            stockfish_level=level,
+        )
+        
+        progress(0.2, desc=f"Playing {n_games} games...")
+        results = evaluator.evaluate(n_games=n_games, verbose=False)
+        
+        # Update leaderboard
+        leaderboard = load_leaderboard()
+        entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
+        if entry is None:
+            entry = {"model_id": model_id}
+            leaderboard.append(entry)
+        
+        entry.update({
+            "elo": results.get("estimated_elo", 1000),
+            "win_rate": results.get("win_rate", 0),
+            "games_played": entry.get("games_played", 0) + n_games,
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        
+        save_leaderboard(leaderboard)
+        progress(1.0, desc="Done!")
+        
+        return f"""
+## 🏆 Win Rate Evaluation for {model_id.split('/')[-1]}
+
+| Metric | Value |
+|--------|-------|
+| **Estimated ELO** | {results.get('estimated_elo', 'N/A'):.0f} |
+| **Win Rate** | {results.get('win_rate', 0)*100:.1f}% |
+| **Draw Rate** | {results.get('draw_rate', 0)*100:.1f}% |
+| **Loss Rate** | {results.get('loss_rate', 0)*100:.1f}% |
+| **Avg Game Length** | {results.get('avg_game_length', 0):.1f} moves |
+| **Illegal Move Rate** | {results.get('illegal_move_rate', 0)*100:.2f}% |
+
+Games played: {n_games} against Stockfish {stockfish_level}
+"""
+        
+    except Exception as e:
+        return f"❌ Evaluation failed: {str(e)}"
+
+
+def evaluate_model(
+    model_id: str,
+    stockfish_level: str,
+    n_games: int,
+    progress: gr.Progress = gr.Progress(),
+) -> str:
+    """Evaluate a model against Stockfish."""
+    try:
+        # Import evaluation code
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        
+        from chess_challenge.evaluate import ChessEvaluator, load_model_from_hub
+        
+        progress(0, desc="Loading model...")
+        model, tokenizer = load_model_from_hub(model_id)
+        
+        progress(0.1, desc="Setting up Stockfish...")
+        level = STOCKFISH_LEVELS.get(stockfish_level, 1)
+        evaluator = ChessEvaluator(
+            model=model,
+            tokenizer=tokenizer,
+            stockfish_level=level,
+        )
+        
+        progress(0.2, desc=f"Playing {n_games} games...")
+        results = evaluator.evaluate(n_games=n_games, verbose=False)
+        
+        # Update leaderboard
+        leaderboard = load_leaderboard()
+        
+        # Find or create entry
+        entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
+        if entry is None:
+            entry = {"model_id": model_id}
+            leaderboard.append(entry)
+        
+        entry.update({
+            "elo": results.get("estimated_elo", 1000),
+            "win_rate": results.get("win_rate", 0),
+            "games_played": entry.get("games_played", 0) + n_games,
+            "illegal_rate": results.get("illegal_move_rate", 0),
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        
+        save_leaderboard(leaderboard)
+        
+        progress(1.0, desc="Done!")
+        
+        return f"""
+## Evaluation Results for {model_id.split('/')[-1]}
+
+| Metric | Value |
+|--------|-------|
+| **Estimated ELO** | {results.get('estimated_elo', 'N/A'):.0f} |
+| **Win Rate** | {results.get('win_rate', 0)*100:.1f}% |
+| **Draw Rate** | {results.get('draw_rate', 0)*100:.1f}% |
+| **Loss Rate** | {results.get('loss_rate', 0)*100:.1f}% |
+| **Avg Game Length** | {results.get('avg_game_length', 0):.1f} moves |
+| **Illegal Move Rate** | {results.get('illegal_move_rate', 0)*100:.2f}% |
+
+Games played: {n_games} against Stockfish {stockfish_level}
+"""
+        
+    except Exception as e:
+        return f"❌ Evaluation failed: {str(e)}"
+
+
+def refresh_leaderboard() -> str:
+    """Refresh and return the leaderboard HTML."""
+    return format_leaderboard_html(load_leaderboard())
+
+
+# Build Gradio Interface
+with gr.Blocks(
+    title="Chess Challenge Arena",
+    theme=gr.themes.Soft(),
+) as demo:
+    gr.Markdown("""
+    # ♟️ Chess Challenge Arena
+    
+    Welcome to the LLM Chess Challenge evaluation arena! 
+    Test your models, see the leaderboard, and compete with your classmates.
+    """)
+    
+    with gr.Tabs():
+        # Leaderboard Tab
+        with gr.TabItem("🏆 Leaderboard"):
+            gr.Markdown("### Current Rankings")
+            leaderboard_html = gr.HTML(value=format_leaderboard_html(load_leaderboard()))
+            refresh_btn = gr.Button("🔄 Refresh Leaderboard")
+            refresh_btn.click(refresh_leaderboard, outputs=leaderboard_html)
+        
+        # Interactive Demo Tab
+        with gr.TabItem("🎮 Interactive Demo"):
+            gr.Markdown("### Test a Model")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    model_dropdown = gr.Dropdown(
+                        choices=get_available_models(),
+                        label="Select Model",
+                        value=None,
+                    )
+                    temperature_slider = gr.Slider(
+                        minimum=0.1,
+                        maximum=2.0,
+                        value=0.7,
+                        step=0.1,
+                        label="Temperature",
+                    )
+                    
+                    with gr.Row():
+                        play_btn = gr.Button("▶️ Model Move", variant="primary")
+                        reset_btn = gr.Button("🔄 Reset")
+                    
+                    status_text = gr.Textbox(label="Status", interactive=False)
+                
+                with gr.Column(scale=1):
+                    board_display = gr.HTML(value=render_board_svg())
+            
+            # Hidden state
+            current_fen = gr.State("startpos")
+            move_history = gr.State("")
+            
+            play_btn.click(
+                play_move,
+                inputs=[model_dropdown, current_fen, move_history, temperature_slider],
+                outputs=[board_display, current_fen, move_history, status_text],
+            )
+            
+            def reset_game():
+                return render_board_svg(), "startpos", "", "Game reset!"
+            
+            reset_btn.click(
+                reset_game,
+                outputs=[board_display, current_fen, move_history, status_text],
+            )
+        
+        # Legal Move Evaluation Tab
+        with gr.TabItem("✅ Legal Move Eval"):
+            gr.Markdown("""
+            ### Phase 1: Legal Move Evaluation
+            
+            Test if your model can generate **legal chess moves** in random positions.
+            This is a quick first check before running full games.
+            
+            - Tests the model on random board positions
+            - Measures how often it generates legal moves
+            - **Recommended before win rate evaluation**
+            """)
+            
+            with gr.Row():
+                legal_model = gr.Dropdown(
+                    choices=get_available_models(),
+                    label="Model to Evaluate",
+                )
+                legal_positions = gr.Slider(
+                    minimum=100,
+                    maximum=1000,
+                    value=500,
+                    step=100,
+                    label="Number of Positions",
+                )
+            
+            legal_btn = gr.Button("✅ Run Legal Move Evaluation", variant="primary")
+            legal_results = gr.Markdown()
+            
+            legal_btn.click(
+                evaluate_legal_moves,
+                inputs=[legal_model, legal_positions],
+                outputs=legal_results,
+            )
+        
+        # Win Rate Evaluation Tab
+        with gr.TabItem("🏆 Win Rate Eval"):
+            gr.Markdown("""
+            ### Phase 2: Win Rate Evaluation
+            
+            Play full games against Stockfish and measure win rate.
+            This evaluation computes your model's **ELO rating**.
+            
+            - Plays complete games against Stockfish
+            - Measures win/draw/loss rates
+            - Estimates ELO rating
+            """)
+            
+            with gr.Row():
+                eval_model = gr.Dropdown(
+                    choices=get_available_models(),
+                    label="Model to Evaluate",
+                )
+                eval_level = gr.Dropdown(
+                    choices=list(STOCKFISH_LEVELS.keys()),
+                    value="Easy (Level 1)",
+                    label="Stockfish Level",
+                )
+                eval_games = gr.Slider(
+                    minimum=10,
+                    maximum=100,
+                    value=50,
+                    step=10,
+                    label="Number of Games",
+                )
+            
+            eval_btn = gr.Button("🏆 Run Win Rate Evaluation", variant="primary")
+            eval_results = gr.Markdown()
+            
+            eval_btn.click(
+                evaluate_winrate,
+                inputs=[eval_model, eval_level, eval_games],
+                outputs=eval_results,
+            )
+        
+        # Submission Guide Tab
+        with gr.TabItem("📤 How to Submit"):
+            gr.Markdown(f"""
+            ### Submitting Your Model
+            
+            1. **Train your model** using the Chess Challenge template
+            
+            2. **Push to Hugging Face Hub**:
+            ```python
+            from chess_challenge import ChessForCausalLM, ChessTokenizer
+            
+            # After training
+            model.push_to_hub("your-model-name", organization="{ORGANIZATION}")
+            tokenizer.push_to_hub("your-model-name", organization="{ORGANIZATION}")
+            ```
+            
+            3. **Verify your submission** by checking the model page on Hugging Face
+            
+            4. **Run evaluations**:
+               - First: **Legal Move Eval** (quick sanity check)
+               - Then: **Win Rate Eval** (full ELO computation)
+            
+            ### Requirements
+            
+            - Model must be under **1M parameters**
+            - Model must use the `ChessConfig` and `ChessForCausalLM` classes
+            - Include the tokenizer with your submission
+            
+            ### Tips for Better Performance
+            
+            - Experiment with different architectures (layers, heads, dimensions)
+            - Try weight tying to save parameters
+            - Fine-tune on high-quality games only
+            - Use RL fine-tuning with Stockfish rewards
+            """)
+
+
+if __name__ == "__main__":
+    demo.launch()
