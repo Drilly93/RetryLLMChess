@@ -593,7 +593,7 @@ with gr.Blocks(
             
             1. **Train your model** using the [Chess Challenge Template](https://github.com/nathanael-fijalkow/ChessChallengeTemplate)
             
-            2. **Push to Hugging Face Hub** using the `submit.py` script provided in the template
+            2. **Push to Hugging Face Hub** using the `submit.py` script provided in the template to make sure that your model is registered correctly.
             
             3. **Verify your submission** by checking the model page on Hugging Face
             
