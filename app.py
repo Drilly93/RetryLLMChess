@@ -585,11 +585,14 @@ with gr.Blocks(
             
             with gr.Row():
                 with gr.Column(scale=1):
-                    model_dropdown = gr.Dropdown(
-                        choices=get_available_models(),
-                        label="Select Model",
-                        value=None,
-                    )
+                    with gr.Row():
+                        model_dropdown = gr.Dropdown(
+                            choices=get_available_models(),
+                            label="Select Model",
+                            value=None,
+                            scale=4,
+                        )
+                        refresh_models_btn = gr.Button("🔄", scale=1)
                     temperature_slider = gr.Slider(
                         minimum=0.1,
                         maximum=2.0,
@@ -610,6 +613,14 @@ with gr.Blocks(
             # Hidden state
             current_fen = gr.State("startpos")
             move_history = gr.State("")
+            
+            def refresh_models():
+                return gr.update(choices=get_available_models())
+            
+            refresh_models_btn.click(
+                refresh_models,
+                outputs=[model_dropdown],
+            )
             
             play_btn.click(
                 play_move,
@@ -640,7 +651,9 @@ with gr.Blocks(
                 legal_model = gr.Dropdown(
                     choices=get_available_models(),
                     label="Model to Evaluate",
+                    scale=4,
                 )
+                refresh_legal_models_btn = gr.Button("🔄", scale=1)
                 legal_positions = gr.Slider(
                     minimum=100,
                     maximum=1000,
@@ -648,6 +661,14 @@ with gr.Blocks(
                     step=100,
                     label="Number of Positions",
                 )
+            
+            def refresh_legal_models():
+                return gr.update(choices=get_available_models())
+            
+            refresh_legal_models_btn.click(
+                refresh_legal_models,
+                outputs=[legal_model],
+            )
             
             legal_btn = gr.Button("Run Legal Move Evaluation", variant="primary")
             legal_results = gr.Markdown()
