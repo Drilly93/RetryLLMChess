@@ -210,7 +210,7 @@ def format_leaderboard_html(data: list) -> str:
                 <td><a href="{model_url}" target="_blank" class="model-link">{entry['model_id'].split('/')[-1]}</a></td>
                 <td class="{legal_class}">{legal_rate*100:.1f}%</td>
                 <td>{legal_rate_first_try*100:.1f}%</td>
-                <!-- <td><strong>{entry.get('elo', 'N/A'):.0f}</strong></td> -->
+                <!-- <td><strong>{entry.get('elo', 'N/A')}</strong></td> -->
                 <!-- <td>{entry.get('win_rate', 0)*100:.1f}%</td> -->
                 <!-- <td>{entry.get('games_played', 0)}</td> -->
                 <td>{entry.get('last_updated', 'N/A')}</td>
@@ -246,12 +246,14 @@ def play_move(
     """Play a move with the selected model."""
     try:
         import chess
-        from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
         
-        # Load model
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+        from src.evaluate import load_model_from_hub
+        
+        # Load model using the same method as evaluation
+        model, tokenizer = load_model_from_hub(model_id)
         model.eval()
         
         # Setup board
