@@ -541,8 +541,6 @@ with gr.Blocks(
             
             - Experiment with different architectures (layers, heads, dimensions)
             - Try weight tying to save parameters
-            - Fine-tune on high-quality games only
-            - Use RL fine-tuning with Stockfish rewards
             """)
         
         # Interactive Demo Tab
