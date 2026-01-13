@@ -339,10 +339,10 @@ def get_model_submitter(model_id: str) -> Optional[str]:
 
 def evaluate_legal_moves(
     model_id: str,
-    n_positions: int,
     progress: gr.Progress = gr.Progress(),
 ) -> str:
     """Evaluate a model's legal move generation."""
+    n_positions = 500  # Fixed number of positions
     try:
         import sys
         sys.path.insert(0, str(Path(__file__).parent))
@@ -691,13 +691,6 @@ with gr.Blocks(
                     label="Model to Evaluate",
                 )
                 refresh_legal_models_btn = gr.Button("🔄", scale=0, min_width=40)
-                legal_positions = gr.Slider(
-                    minimum=100,
-                    maximum=1000,
-                    value=500,
-                    step=100,
-                    label="Number of Positions",
-                )
             
             def refresh_legal_models():
                 return gr.update(choices=get_available_models())
@@ -712,7 +705,7 @@ with gr.Blocks(
             
             legal_btn.click(
                 evaluate_legal_moves,
-                inputs=[legal_model, legal_positions],
+                inputs=[legal_model],
                 outputs=legal_results,
             )
         
