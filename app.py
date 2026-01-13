@@ -151,13 +151,7 @@ def format_leaderboard_html(data: list) -> str:
         }
         .leaderboard-table td {
             padding: 10px 12px;
-            border-bottom: 1px solid #ddd;
-        }
-        .leaderboard-table tr:nth-child(even) {
-            background-color: #f8f9fa;
-        }
-        .leaderboard-table tr:hover {
-            background-color: #e9ecef;
+            border-bottom: 1px solid var(--border-color-primary, #ddd);
         }
         .rank-1 { color: #ffd700; font-weight: bold; }
         .rank-2 { color: #c0c0c0; font-weight: bold; }
