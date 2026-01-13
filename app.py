@@ -46,6 +46,7 @@ STOCKFISH_LEVELS = {
 # CSV columns for the leaderboard
 LEADERBOARD_COLUMNS = [
     "model_id",
+    "user_id",
     "legal_rate",
     "legal_rate_first_try",
     # "elo",
@@ -171,6 +172,7 @@ def format_leaderboard_html(data: list) -> str:
         <thead>
             <tr>
                 <th>Rank</th>
+                <th>User</th>
                 <th>Model</th>
                 <th>Legal Rate</th>
                 <th>Legal Rate (1st try)</th>
@@ -199,9 +201,12 @@ def format_leaderboard_html(data: list) -> str:
             legal_class = "legal-bad"
         
         legal_rate_first_try = entry.get('legal_rate_first_try', 0)
+        user_id = entry.get('user_id', 'unknown')
+        user_url = f"https://huggingface.co/{user_id}"
         html += f"""
             <tr>
                 <td class="{rank_class}">{rank_display}</td>
+                <td><a href="{user_url}" target="_blank" class="model-link">{user_id}</a></td>
                 <td><a href="{model_url}" target="_blank" class="model-link">{entry['model_id'].split('/')[-1]}</a></td>
                 <td class="{legal_class}">{legal_rate*100:.1f}%</td>
                 <td>{legal_rate_first_try*100:.1f}%</td>
@@ -325,20 +330,43 @@ def evaluate_legal_moves(
         progress(0.2, desc=f"Testing {n_positions} positions...")
         results = evaluator.evaluate_legal_moves(n_positions=n_positions, verbose=False)
         
-        # Update leaderboard
+        # Extract user_id from model_id (format: user_id/model_name)
+        user_id = model_id.split('/')[0] if '/' in model_id else 'unknown'
+        
+        # Update leaderboard - only if improved
         leaderboard = load_leaderboard()
         entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
+        
+        new_legal_rate = results.get("legal_rate_with_retry", 0)
+        new_legal_rate_first_try = results.get("legal_rate_first_try", 0)
+        
         if entry is None:
-            entry = {"model_id": model_id}
+            # New model - add to leaderboard
+            entry = {
+                "model_id": model_id,
+                "user_id": user_id,
+                "legal_rate": new_legal_rate,
+                "legal_rate_first_try": new_legal_rate_first_try,
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
             leaderboard.append(entry)
+            save_leaderboard(leaderboard)
+            update_message = "New entry added to leaderboard!"
+        else:
+            # Existing model - only update if improved
+            old_legal_rate = entry.get("legal_rate", 0)
+            if new_legal_rate > old_legal_rate:
+                entry.update({
+                    "user_id": user_id,
+                    "legal_rate": new_legal_rate,
+                    "legal_rate_first_try": new_legal_rate_first_try,
+                    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+                save_leaderboard(leaderboard)
+                update_message = f"Improved! Previous: {old_legal_rate*100:.1f}% → New: {new_legal_rate*100:.1f}%"
+            else:
+                update_message = f"ℹNo improvement. Current best: {old_legal_rate*100:.1f}%, This run: {new_legal_rate*100:.1f}%"
         
-        entry.update({
-            "legal_rate": results.get("legal_rate_with_retry", 0),
-            "legal_rate_first_try": results.get("legal_rate_first_try", 0),
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        })
-        
-        save_leaderboard(leaderboard)
         progress(1.0, desc="Done!")
         
         return f"""
@@ -350,6 +378,9 @@ def evaluate_legal_moves(
 | **Legal (1st try)** | {results['legal_first_try']} ({results['legal_rate_first_try']*100:.1f}%) |
 | **Legal (with retries)** | {results['legal_first_try'] + results['legal_with_retry']} ({results['legal_rate_with_retry']*100:.1f}%) |
 | **Always Illegal** | {results['illegal_all_retries']} ({results['illegal_rate']*100:.1f}%) |
+
+### Leaderboard Update
+{update_message}
 
 ### Interpretation
 - **>90% legal rate**: Great! Model has learned chess rules well.
