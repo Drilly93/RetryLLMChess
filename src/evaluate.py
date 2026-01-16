@@ -767,11 +767,12 @@ def load_model_from_hub(model_id: str, device: str = "auto"):
     from src.model import ChessConfig, ChessForCausalLM
     from src.tokenizer import ChessTokenizer
     
-    # Try loading with custom tokenizer first, fall back to AutoTokenizer
+    # Try AutoTokenizer with trust_remote_code first to load custom tokenizer.py from Hub
+    # Fall back to local ChessTokenizer if the model doesn't have a custom tokenizer
     try:
-        tokenizer = ChessTokenizer.from_pretrained(model_id)
-    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    except Exception:
+        tokenizer = ChessTokenizer.from_pretrained(model_id)
     
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
