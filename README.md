@@ -1,6 +1,6 @@
 ---
 title: Chess Challenge Arena
-emoji: chess_pawn
+emoji: "♟️"
 colorFrom: gray
 colorTo: yellow
 sdk: gradio
