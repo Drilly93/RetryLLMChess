@@ -621,7 +621,7 @@ with gr.Blocks(
             """)
             
             with gr.Row():
-                model_dropdown = gr.Dropdown(
+                model_dropdown = gr.ComboBox(
                     choices=get_available_models(),
                     label="Model to Evaluate",
                     scale=4,
