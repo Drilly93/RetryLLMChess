@@ -44,100 +44,6 @@ LEADERBOARD_COLUMNS = [
     "last_updated",
 ]
 
-
-# =============================================================================
-# Webhook Queue and Worker
-# =============================================================================
-
-eval_queue = queue.Queue()
-eval_status = {}  # Track status of queued evaluations
-eval_lock = threading.Lock()
-
-
-def evaluation_worker():
-    """Background worker that processes evaluation queue."""
-    while True:
-        try:
-            model_id = eval_queue.get()
-            
-            with eval_lock:
-                eval_status[model_id] = "running"
-            
-            print(f"[Webhook Worker] Starting evaluation for: {model_id}")
-            
-            try:
-                sys.path.insert(0, str(Path(__file__).parent))
-                from src.evaluate import (
-                    ChessEvaluator,
-                    load_model_and_tokenizer,
-                    post_discussion_summary,
-                )
-                
-                # Load and evaluate
-                model, tokenizer, _ = load_model_and_tokenizer(model_id, verbose=True)
-                evaluator = ChessEvaluator(model=model, tokenizer=tokenizer, model_path=model_id)
-                result = evaluator.evaluate(verbose=True)
-                
-                # Update leaderboard if evaluation succeeded
-                if result.passed_param_check and result.passed_pychess_check and not result.error_message:
-                    user_id = get_model_submitter(model_id)
-                    if user_id:
-                        leaderboard = load_leaderboard()
-                        user_entry = next((e for e in leaderboard if e.get("user_id") == user_id), None)
-                        
-                        new_entry = {
-                            "model_id": model_id,
-                            "user_id": user_id,
-                            "n_parameters": result.n_parameters,
-                            "legal_rate_first_try": result.legal_rate_first_try,
-                            "legal_rate_with_retry": result.legal_rate_with_retry,
-                            "games_played": result.games_played,
-                            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        }
-                        
-                        if user_entry is None:
-                            leaderboard.append(new_entry)
-                            save_leaderboard(leaderboard)
-                            print(f"[Webhook Worker] Added {model_id} to leaderboard")
-                        elif result.legal_rate_with_retry > user_entry.get("legal_rate_with_retry", 0):
-                            user_entry.update(new_entry)
-                            save_leaderboard(leaderboard)
-                            print(f"[Webhook Worker] Updated {model_id} on leaderboard (improvement)")
-                        else:
-                            print(f"[Webhook Worker] {model_id} - no improvement, not updating leaderboard")
-                        
-                        # Post results to model discussion
-                        if HF_TOKEN:
-                            try:
-                                post_discussion_summary(model_id, result, HF_TOKEN)
-                                print(f"[Webhook Worker] Posted results to {model_id} discussion")
-                            except Exception as e:
-                                print(f"[Webhook Worker] Failed to post discussion: {e}")
-                    else:
-                        print(f"[Webhook Worker] Could not determine submitter for {model_id}")
-                else:
-                    print(f"[Webhook Worker] Evaluation failed for {model_id}: {result.error_message}")
-                
-                with eval_lock:
-                    eval_status[model_id] = "completed"
-                    
-            except Exception as e:
-                print(f"[Webhook Worker] Error evaluating {model_id}: {e}")
-                with eval_lock:
-                    eval_status[model_id] = f"error: {str(e)}"
-                    
-        except Exception as e:
-            print(f"[Webhook Worker] Queue error: {e}")
-        finally:
-            eval_queue.task_done()
-
-
-# Start the background worker thread
-worker_thread = threading.Thread(target=evaluation_worker, daemon=True)
-worker_thread.start()
-print("[Webhook] Evaluation worker started")
-
-
 def is_chess_model(model_id: str) -> bool:
     """Check if a model ID looks like a chess challenge submission."""
     if not model_id.startswith(f"{ORGANIZATION}/"):
@@ -171,9 +77,6 @@ def load_leaderboard() -> list:
         )
         
         df = pd.read_csv(csv_path)
-        # Map 'legal_rate' column to 'legal_rate_with_retry' if present
-        if 'legal_rate_with_retry' not in df.columns and 'legal_rate' in df.columns:
-            df['legal_rate_with_retry'] = df['legal_rate']
         return df.to_dict(orient="records")
     
     except Exception as e:
@@ -283,16 +186,16 @@ def format_leaderboard_html(data: list) -> str:
     if not data:
         return "<p>No models evaluated yet. Be the first to submit!</p>"
     
-    # Keep only the best entry per user (by legal_rate_with_retry)
+    # Keep only the best entry per user (by legal_rate)
     best_per_user = {}
     for entry in data:
         user_id = entry.get("user_id", "unknown")
-        legal_rate = entry.get("legal_rate_with_retry", 0)
-        if user_id not in best_per_user or legal_rate > best_per_user[user_id].get("legal_rate_with_retry", 0):
+        legal_rate = entry.get("legal_rate", 0)
+        if user_id not in best_per_user or legal_rate > best_per_user[user_id].get("legal_rate", 0):
             best_per_user[user_id] = entry
     
-    # Sort by legal_rate_with_retry
-    sorted_data = sorted(best_per_user.values(), key=lambda x: x.get("legal_rate_with_retry", 0), reverse=True)
+    # Sort by legal_rate
+    sorted_data = sorted(best_per_user.values(), key=lambda x: x.get("legal_rate", 0), reverse=True)
     
     html = """
     <style>
@@ -339,7 +242,7 @@ def format_leaderboard_html(data: list) -> str:
         rank_display = str(i)
         model_url = f"https://huggingface.co/{entry['model_id']}"
         # Color code legal rate
-        legal_rate = entry.get('legal_rate_with_retry', 0)
+        legal_rate = entry.get('legal_rate', 0)
         if legal_rate >= 0.9:
             legal_class = "legal-good"
         elif legal_rate >= 0.7:
@@ -465,7 +368,7 @@ which adds the required metadata to the README.md file.
             "user_id": user_id,
             "n_parameters": result.n_parameters,
             "legal_rate_first_try": result.legal_rate_first_try,
-            "legal_rate_with_retry": result.legal_rate_with_retry,
+            "legal_rate": result.legal_rate,
             "games_played": result.games_played,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
@@ -475,13 +378,13 @@ which adds the required metadata to the README.md file.
             save_leaderboard(leaderboard)
             update_message = "New entry added to leaderboard!"
         else:
-            old_rate = user_entry.get("legal_rate_with_retry", 0)
-            if result.legal_rate_with_retry > old_rate:
+            old_rate = user_entry.get("legal_rate", 0)
+            if result.legal_rate > old_rate:
                 user_entry.update(new_entry)
                 save_leaderboard(leaderboard)
-                update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate_with_retry*100:.1f}%"
+                update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate*100:.1f}%"
             else:
-                update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate_with_retry*100:.1f}%"
+                update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate*100:.1f}%"
         
         # Post discussion to model page
         if HF_TOKEN:
