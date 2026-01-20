@@ -325,10 +325,8 @@ def format_leaderboard_html(data: list) -> str:
                 <th>Rank</th>
                 <th>User</th>
                 <th>Model</th>
-                <th>Parameters</th>
-                <th>Legal Rate (1st try)</th>
                 <th>Legal Rate (with retries)</th>
-                <th>Games</th>
+                <th>Legal Rate (1st try)</th>
                 <th>Last Updated</th>
             </tr>
         </thead>
@@ -337,10 +335,8 @@ def format_leaderboard_html(data: list) -> str:
     
     for i, entry in enumerate(sorted_data, 1):
         rank_class = f"rank-{i}" if i <= 3 else ""
-        rank_display = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else str(i)
-        
+        rank_display = str(i)
         model_url = f"https://huggingface.co/{entry['model_id']}"
-        
         # Color code legal rate
         legal_rate = entry.get('legal_rate_with_retry', 0)
         if legal_rate >= 0.9:
@@ -349,22 +345,16 @@ def format_leaderboard_html(data: list) -> str:
             legal_class = "legal-medium"
         else:
             legal_class = "legal-bad"
-        
         user_id = entry.get('user_id', 'unknown')
         user_url = f"https://huggingface.co/{user_id}"
-        n_params = entry.get('n_parameters', 0)
         legal_rate_first = entry.get('legal_rate_first_try', 0)
-        games = entry.get('games_played', 0)
-        
         html += f"""
             <tr>
                 <td class="{rank_class}">{rank_display}</td>
                 <td><a href="{user_url}" target="_blank" class="model-link">{user_id}</a></td>
                 <td><a href="{model_url}" target="_blank" class="model-link">{entry['model_id'].split('/')[-1]}</a></td>
-                <td>{n_params:,}</td>
-                <td>{legal_rate_first*100:.1f}%</td>
                 <td class="{legal_class}">{legal_rate*100:.1f}%</td>
-                <td>{games}</td>
+                <td>{legal_rate_first*100:.1f}%</td>
                 <td>{entry.get('last_updated', 'N/A')}</td>
             </tr>
         """
