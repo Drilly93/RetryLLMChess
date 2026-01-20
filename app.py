@@ -173,6 +173,9 @@ def load_leaderboard() -> list:
         )
         
         df = pd.read_csv(csv_path)
+        # Map 'legal_rate' column to 'legal_rate_with_retry' if present
+        if 'legal_rate_with_retry' not in df.columns and 'legal_rate' in df.columns:
+            df['legal_rate_with_retry'] = df['legal_rate']
         return df.to_dict(orient="records")
     
     except Exception as e:
