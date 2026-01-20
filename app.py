@@ -39,10 +39,8 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "459f4c2c6b0b4b6468e21f9811037
 LEADERBOARD_COLUMNS = [
     "model_id",
     "user_id",
-    "n_parameters",
+    "legal_rate",
     "legal_rate_first_try",
-    "legal_rate_with_retry",
-    "games_played",
     "last_updated",
 ]
 
