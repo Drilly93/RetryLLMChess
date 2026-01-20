@@ -10,6 +10,7 @@ build/
 *.egg
 
 .github/
+script.py
 
 # Virtual environments
 .venv/
