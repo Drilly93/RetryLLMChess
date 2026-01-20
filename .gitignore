@@ -9,6 +9,8 @@ dist/
 build/
 *.egg
 
+.github/
+
 # Virtual environments
 .venv/
 venv/

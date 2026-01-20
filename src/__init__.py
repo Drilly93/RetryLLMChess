@@ -1,22 +1,20 @@
-"""Chess Challenge source module."""
+"""Chess Challenge evaluation module."""
 
-from .model import ChessConfig, ChessForCausalLM
-from .tokenizer import ChessTokenizer
-
-# Lazy import for evaluate to avoid RuntimeWarning when running as module
+# Lazy imports to avoid circular dependencies
 def __getattr__(name):
     if name == "ChessEvaluator":
         from .evaluate import ChessEvaluator
         return ChessEvaluator
-    if name == "load_model_from_hub":
-        from .evaluate import load_model_from_hub
-        return load_model_from_hub
+    if name == "load_model_and_tokenizer":
+        from .evaluate import load_model_and_tokenizer
+        return load_model_and_tokenizer
+    if name == "count_parameters":
+        from .evaluate import count_parameters
+        return count_parameters
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
-    "ChessConfig",
-    "ChessForCausalLM", 
-    "ChessTokenizer",
     "ChessEvaluator",
-    "load_model_from_hub",
+    "load_model_and_tokenizer",
+    "count_parameters",
 ]

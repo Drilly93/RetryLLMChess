@@ -1,21 +1,26 @@
 """
-Play Chess like a Honey Bee
+Play Chess like a Honey Bee - Chess Challenge Arena
 
 This Gradio app provides:
-1. Interactive demo to test models
-2. Leaderboard of submitted models
-3. Live game visualization
+1. Leaderboard of submitted models
+2. Model evaluation interface
+3. Submission guide
+4. Webhook endpoint for automatic evaluation
 
-Instructions:
 The goal is to train a language model to play chess, under a strict constraint:
 less than 1M parameters! This is approximately the number of neurons of a honey bee.
 
 Leaderboard data is stored in a private HuggingFace dataset for persistence.
 """
 
+import hashlib
+import hmac
 import io
+import json
 import os
+import queue
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -28,38 +33,138 @@ ORGANIZATION = os.environ.get("HF_ORGANIZATION", "LLM-course")
 LEADERBOARD_DATASET = os.environ.get("LEADERBOARD_DATASET", f"{ORGANIZATION}/chess-challenge-leaderboard")
 LEADERBOARD_FILENAME = "leaderboard.csv"
 HF_TOKEN = os.environ.get("HF_TOKEN")  # Required for private dataset access
-
-# Evaluation settings
-EVAL_SEED = 42
-EVAL_N_POSITIONS = 500
-
-STOCKFISH_LEVELS = {
-    "Beginner (Level 0)": 0,
-    "Easy (Level 1)": 1,
-    "Medium (Level 3)": 3,
-    "Hard (Level 5)": 5,
-}
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "459f4c2c6b0b4b6468e21f981103753d14219d4955f07ab457e100fee93cae66")
 
 # CSV columns for the leaderboard
 LEADERBOARD_COLUMNS = [
     "model_id",
     "user_id",
-    "legal_rate",
+    "n_parameters",
     "legal_rate_first_try",
-    # "elo",
-    # "win_rate",
-    # "draw_rate",
-    # "games_played",
+    "legal_rate_with_retry",
+    "games_played",
     "last_updated",
 ]
 
+
+# =============================================================================
+# Webhook Queue and Worker
+# =============================================================================
+
+eval_queue = queue.Queue()
+eval_status = {}  # Track status of queued evaluations
+eval_lock = threading.Lock()
+
+
+def evaluation_worker():
+    """Background worker that processes evaluation queue."""
+    while True:
+        try:
+            model_id = eval_queue.get()
+            
+            with eval_lock:
+                eval_status[model_id] = "running"
+            
+            print(f"[Webhook Worker] Starting evaluation for: {model_id}")
+            
+            try:
+                sys.path.insert(0, str(Path(__file__).parent))
+                from src.evaluate import (
+                    ChessEvaluator,
+                    load_model_and_tokenizer,
+                    post_discussion_summary,
+                )
+                
+                # Load and evaluate
+                model, tokenizer, _ = load_model_and_tokenizer(model_id, verbose=True)
+                evaluator = ChessEvaluator(model=model, tokenizer=tokenizer, model_path=model_id)
+                result = evaluator.evaluate(verbose=True)
+                
+                # Update leaderboard if evaluation succeeded
+                if result.passed_param_check and result.passed_pychess_check and not result.error_message:
+                    user_id = get_model_submitter(model_id)
+                    if user_id:
+                        leaderboard = load_leaderboard()
+                        user_entry = next((e for e in leaderboard if e.get("user_id") == user_id), None)
+                        
+                        new_entry = {
+                            "model_id": model_id,
+                            "user_id": user_id,
+                            "n_parameters": result.n_parameters,
+                            "legal_rate_first_try": result.legal_rate_first_try,
+                            "legal_rate_with_retry": result.legal_rate_with_retry,
+                            "games_played": result.games_played,
+                            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        }
+                        
+                        if user_entry is None:
+                            leaderboard.append(new_entry)
+                            save_leaderboard(leaderboard)
+                            print(f"[Webhook Worker] Added {model_id} to leaderboard")
+                        elif result.legal_rate_with_retry > user_entry.get("legal_rate_with_retry", 0):
+                            user_entry.update(new_entry)
+                            save_leaderboard(leaderboard)
+                            print(f"[Webhook Worker] Updated {model_id} on leaderboard (improvement)")
+                        else:
+                            print(f"[Webhook Worker] {model_id} - no improvement, not updating leaderboard")
+                        
+                        # Post results to model discussion
+                        if HF_TOKEN:
+                            try:
+                                post_discussion_summary(model_id, result, HF_TOKEN)
+                                print(f"[Webhook Worker] Posted results to {model_id} discussion")
+                            except Exception as e:
+                                print(f"[Webhook Worker] Failed to post discussion: {e}")
+                    else:
+                        print(f"[Webhook Worker] Could not determine submitter for {model_id}")
+                else:
+                    print(f"[Webhook Worker] Evaluation failed for {model_id}: {result.error_message}")
+                
+                with eval_lock:
+                    eval_status[model_id] = "completed"
+                    
+            except Exception as e:
+                print(f"[Webhook Worker] Error evaluating {model_id}: {e}")
+                with eval_lock:
+                    eval_status[model_id] = f"error: {str(e)}"
+                    
+        except Exception as e:
+            print(f"[Webhook Worker] Queue error: {e}")
+        finally:
+            eval_queue.task_done()
+
+
+# Start the background worker thread
+worker_thread = threading.Thread(target=evaluation_worker, daemon=True)
+worker_thread.start()
+print("[Webhook] Evaluation worker started")
+
+
+def is_chess_model(model_id: str) -> bool:
+    """Check if a model ID looks like a chess challenge submission."""
+    if not model_id.startswith(f"{ORGANIZATION}/"):
+        return False
+    model_name = model_id.split("/")[-1].lower()
+    return "chess" in model_name
+
+
+def verify_webhook_signature(body: bytes, signature: str) -> bool:
+    """Verify the webhook signature using HMAC-SHA256."""
+    if not WEBHOOK_SECRET:
+        return True  # Skip verification if no secret configured
+    expected = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature or "", expected)
+
+
+# =============================================================================
+# Leaderboard Management
+# =============================================================================
 
 def load_leaderboard() -> list:
     """Load leaderboard from private HuggingFace dataset."""
     try:
         from huggingface_hub import hf_hub_download
         
-        # Download the CSV file from the dataset
         csv_path = hf_hub_download(
             repo_id=LEADERBOARD_DATASET,
             filename=LEADERBOARD_FILENAME,
@@ -72,7 +177,6 @@ def load_leaderboard() -> list:
     
     except Exception as e:
         print(f"Could not load leaderboard from dataset: {e}")
-        # Return empty list if dataset doesn't exist yet
         return []
 
 
@@ -81,7 +185,6 @@ def save_leaderboard(data: list):
     try:
         from huggingface_hub import HfApi
         
-        # Convert to DataFrame
         df = pd.DataFrame(data, columns=LEADERBOARD_COLUMNS)
         
         # Fill missing columns with defaults
@@ -89,7 +192,6 @@ def save_leaderboard(data: list):
             if col not in df.columns:
                 df[col] = None
         
-        # Reorder columns
         df = df[LEADERBOARD_COLUMNS]
         
         # Convert to CSV bytes
@@ -118,25 +220,21 @@ def get_available_models() -> list:
     try:
         from huggingface_hub import list_models
         
-        # Get all chess models sorted by newest first
         models = list(list_models(author=ORGANIZATION, sort="lastModified", direction=-1))
         chess_models = [m for m in models if "chess" in m.id.lower()]
         
-        # Keep only the latest model per user (based on model name pattern: chess-<username>-*)
+        # Keep only the latest model per user
         seen_users = set()
         filtered_models = []
         for m in chess_models:
-            # Extract username from model id (format: LLM-course/chess-<username>-<modelname>)
-            model_name = m.id.split("/")[-1]  # e.g., "chess-johndoe-mymodel"
+            model_name = m.id.split("/")[-1]
             parts = model_name.split("-")
             if len(parts) >= 2:
-                # Username is after "chess-"
                 username = parts[1] if parts[0] == "chess" else None
                 if username and username not in seen_users:
                     seen_users.add(username)
                     filtered_models.append(m.id)
             else:
-                # If pattern doesn't match, include the model anyway
                 filtered_models.append(m.id)
         
         return filtered_models if filtered_models else ["No models available"]
@@ -145,21 +243,55 @@ def get_available_models() -> list:
         return ["No models available"]
 
 
+def get_model_submitter(model_id: str) -> Optional[str]:
+    """Extract the submitter's username from the model's README on HuggingFace."""
+    try:
+        from huggingface_hub import hf_hub_download
+        import re
+        
+        readme_path = hf_hub_download(
+            repo_id=model_id,
+            filename="README.md",
+            token=HF_TOKEN,
+        )
+        
+        with open(readme_path, "r") as f:
+            readme_content = f.read()
+        
+        match = re.search(r'\*\*Submitted by\*\*:\s*\[([^\]]+)\]', readme_content)
+        if match:
+            return match.group(1)
+        
+        from huggingface_hub import model_info
+        info = model_info(model_id, token=HF_TOKEN)
+        if info.author:
+            return info.author
+            
+    except Exception as e:
+        print(f"Could not extract submitter from model: {e}")
+    
+    return None
+
+
+# =============================================================================
+# Leaderboard Formatting
+# =============================================================================
+
 def format_leaderboard_html(data: list) -> str:
     """Format leaderboard data as HTML table."""
     if not data:
         return "<p>No models evaluated yet. Be the first to submit!</p>"
     
-    # Keep only the best entry per user
+    # Keep only the best entry per user (by legal_rate_with_retry)
     best_per_user = {}
     for entry in data:
         user_id = entry.get("user_id", "unknown")
-        legal_rate = entry.get("legal_rate", 0)
-        if user_id not in best_per_user or legal_rate > best_per_user[user_id].get("legal_rate", 0):
+        legal_rate = entry.get("legal_rate_with_retry", 0)
+        if user_id not in best_per_user or legal_rate > best_per_user[user_id].get("legal_rate_with_retry", 0):
             best_per_user[user_id] = entry
     
-    # Sort by legal_rate
-    sorted_data = sorted(best_per_user.values(), key=lambda x: x.get("legal_rate", 0), reverse=True)
+    # Sort by legal_rate_with_retry
+    sorted_data = sorted(best_per_user.values(), key=lambda x: x.get("legal_rate_with_retry", 0), reverse=True)
     
     html = """
     <style>
@@ -193,11 +325,10 @@ def format_leaderboard_html(data: list) -> str:
                 <th>Rank</th>
                 <th>User</th>
                 <th>Model</th>
-                <th>Legal Rate</th>
+                <th>Parameters</th>
                 <th>Legal Rate (1st try)</th>
-                <!-- <th>ELO</th> -->
-                <!-- <th>Win Rate</th> -->
-                <!-- <th>Games</th> -->
+                <th>Legal Rate (with retries)</th>
+                <th>Games</th>
                 <th>Last Updated</th>
             </tr>
         </thead>
@@ -211,7 +342,7 @@ def format_leaderboard_html(data: list) -> str:
         model_url = f"https://huggingface.co/{entry['model_id']}"
         
         # Color code legal rate
-        legal_rate = entry.get('legal_rate', 0)
+        legal_rate = entry.get('legal_rate_with_retry', 0)
         if legal_rate >= 0.9:
             legal_class = "legal-good"
         elif legal_rate >= 0.7:
@@ -219,19 +350,21 @@ def format_leaderboard_html(data: list) -> str:
         else:
             legal_class = "legal-bad"
         
-        legal_rate_first_try = entry.get('legal_rate_first_try', 0)
         user_id = entry.get('user_id', 'unknown')
         user_url = f"https://huggingface.co/{user_id}"
+        n_params = entry.get('n_parameters', 0)
+        legal_rate_first = entry.get('legal_rate_first_try', 0)
+        games = entry.get('games_played', 0)
+        
         html += f"""
             <tr>
                 <td class="{rank_class}">{rank_display}</td>
                 <td><a href="{user_url}" target="_blank" class="model-link">{user_id}</a></td>
                 <td><a href="{model_url}" target="_blank" class="model-link">{entry['model_id'].split('/')[-1]}</a></td>
+                <td>{n_params:,}</td>
+                <td>{legal_rate_first*100:.1f}%</td>
                 <td class="{legal_class}">{legal_rate*100:.1f}%</td>
-                <td>{legal_rate_first_try*100:.1f}%</td>
-                <!-- <td><strong>{entry.get('elo', 'N/A')}</strong></td> -->
-                <!-- <td>{entry.get('win_rate', 0)*100:.1f}%</td> -->
-                <!-- <td>{entry.get('games_played', 0)}</td> -->
+                <td>{games}</td>
                 <td>{entry.get('last_updated', 'N/A')}</td>
             </tr>
         """
@@ -240,377 +373,160 @@ def format_leaderboard_html(data: list) -> str:
     return html
 
 
-def render_board_svg(fen: str = "startpos") -> str:
-    """Render a chess board as SVG."""
-    try:
-        import chess
-        import chess.svg
-        
-        if fen == "startpos":
-            board = chess.Board()
-        else:
-            board = chess.Board(fen)
-        
-        return chess.svg.board(board, size=400)
-    except ImportError:
-        return "<p>Install python-chess to see the board</p>"
+# =============================================================================
+# Evaluation Functions
+# =============================================================================
 
-
-def play_move(
-    model_id: str,
-    current_fen: str,
-    move_history: str,
-    temperature: float,
-) -> tuple:
-    """Play a move with the selected model."""
-    try:
-        import chess
-        import torch
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent))
-        
-        from src.evaluate import load_model_from_hub
-        
-        # Load model using the same method as evaluation
-        model, tokenizer = load_model_from_hub(model_id)
-        model.eval()
-        
-        # Setup board
-        board = chess.Board(current_fen) if current_fen != "startpos" else chess.Board()
-        
-        # Tokenize history
-        if move_history:
-            inputs = tokenizer(move_history, return_tensors="pt")
-        else:
-            inputs = tokenizer(tokenizer.bos_token, return_tensors="pt")
-        
-        # Generate move
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits[:, -1, :] / temperature
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-        
-        move_token = tokenizer.decode(next_token[0])
-        
-        # Parse move
-        if len(move_token) >= 6:
-            uci_move = move_token[2:4] + move_token[4:6]
-            try:
-                move = chess.Move.from_uci(uci_move)
-                if move in board.legal_moves:
-                    board.push(move)
-                    new_history = f"{move_history} {move_token}".strip()
-                    return (
-                        render_board_svg(board.fen()),
-                        board.fen(),
-                        new_history,
-                        f"Model played: {move_token} ({uci_move})",
-                    )
-            except:
-                pass
-        
-        return (
-            render_board_svg(current_fen if current_fen != "startpos" else None),
-            current_fen,
-            move_history,
-            f"Model generated illegal move: {move_token}",
-        )
-        
-    except Exception as e:
-        return (
-            render_board_svg(),
-            "startpos",
-            "",
-            f"Error: {str(e)}",
-        )
-
-
-def get_model_submitter(model_id: str) -> Optional[str]:
-    """Extract the submitter's username from the model's README on HuggingFace.
-    
-    Returns None if the submitter cannot be determined.
-    """
-    try:
-        from huggingface_hub import hf_hub_download
-        import re
-        
-        # Download the README.md from the model repo
-        readme_path = hf_hub_download(
-            repo_id=model_id,
-            filename="README.md",
-            token=HF_TOKEN,
-        )
-        
-        with open(readme_path, "r") as f:
-            readme_content = f.read()
-        
-        # Look for the pattern: **Submitted by**: [username](https://huggingface.co/username)
-        match = re.search(r'\*\*Submitted by\*\*:\s*\[([^\]]+)\]', readme_content)
-        if match:
-            return match.group(1)
-        
-        # Fallback: try to get from model info
-        from huggingface_hub import model_info
-        info = model_info(model_id, token=HF_TOKEN)
-        if info.author:
-            return info.author
-            
-    except Exception as e:
-        print(f"Could not extract submitter from model: {e}")
-    
-    return None
-
-
-def evaluate_legal_moves(
+def run_evaluation(
     model_id: str,
     progress: gr.Progress = gr.Progress(),
 ) -> str:
-    """Evaluate a model's legal move generation."""
+    """
+    Run evaluation on a model and update the leaderboard.
+    
+    Evaluation procedure:
+    1. Check if model has < 1M parameters
+    2. Check if model uses python-chess illegally
+    3. Play 500 moves against opponent engine (restart after 25 moves)
+    4. Track legal move rates
+    5. Update leaderboard and post discussion
+    """
     try:
-        import sys
-        import io
-        from contextlib import redirect_stdout
-        
         sys.path.insert(0, str(Path(__file__).parent))
         
-        from src.evaluate import ChessEvaluator, load_model_from_hub
+        from src.evaluate import (
+            ChessEvaluator,
+            load_model_and_tokenizer,
+            post_discussion_summary,
+        )
         
         progress(0, desc="Loading model...")
         
-        # Capture tokenizer debug info
-        debug_output = io.StringIO()
-        with redirect_stdout(debug_output):
-            model, tokenizer = load_model_from_hub(model_id, verbose=True)
-        tokenizer_info = debug_output.getvalue()
+        # Load model
+        model, tokenizer, _ = load_model_and_tokenizer(model_id, verbose=True)
         
         progress(0.1, desc="Setting up evaluator...")
+        
+        # Create evaluator
         evaluator = ChessEvaluator(
             model=model,
             tokenizer=tokenizer,
-            stockfish_level=1,  # Not used for legal move eval
+            model_path=model_id,
         )
         
-        progress(0.2, desc=f"Testing {EVAL_N_POSITIONS} positions...")
-        results = evaluator.evaluate_legal_moves(
-            n_positions=EVAL_N_POSITIONS,
-            verbose=False,
-            seed=EVAL_SEED,
-        )
+        progress(0.2, desc="Running evaluation (500 moves)...")
         
-        # Extract user_id from model's README (submitted by field)
+        # Run evaluation
+        result = evaluator.evaluate(verbose=True)
+        
+        progress(0.9, desc="Updating leaderboard...")
+        
+        # Check if evaluation was successful
+        if not result.passed_param_check:
+            return f"""## Evaluation Failed
+
+**Model**: `{model_id}`
+**Parameters**: {result.n_parameters:,}
+
+Model exceeds the **1M parameter limit**. Please reduce model size and resubmit.
+"""
+        
+        if not result.passed_pychess_check:
+            return f"""## Evaluation Failed
+
+**Model**: `{model_id}`
+
+Model illegally uses python-chess for move filtering: {result.error_message}
+
+This is not allowed. The model must generate moves without access to legal move lists.
+"""
+        
+        if result.error_message:
+            return f"""## Evaluation Error
+
+**Model**: `{model_id}`
+
+An error occurred during evaluation: {result.error_message}
+"""
+        
+        # Get submitter info
         user_id = get_model_submitter(model_id)
         if user_id is None:
-            return f"""## Evaluation Failed
+            return f"""## Evaluation Issue
 
 Could not determine the submitter for model `{model_id}`.
 
 Please ensure your model was submitted using the official submission script (`submit.py`), 
 which adds the required metadata to the README.md file.
+
+**Evaluation Results** (not saved to leaderboard):
+{result.summary()}
 """
         
-        # Update leaderboard - only one entry per user, keep the best
+        # Update leaderboard
         leaderboard = load_leaderboard()
         
-        # Find existing entry for this user (not model - one entry per user)
+        # Find existing entry for this user
         user_entry = next((e for e in leaderboard if e.get("user_id") == user_id), None)
         
-        new_legal_rate = results.get("legal_rate_with_retry", 0)
-        new_legal_rate_first_try = results.get("legal_rate_first_try", 0)
+        new_entry = {
+            "model_id": model_id,
+            "user_id": user_id,
+            "n_parameters": result.n_parameters,
+            "legal_rate_first_try": result.legal_rate_first_try,
+            "legal_rate_with_retry": result.legal_rate_with_retry,
+            "games_played": result.games_played,
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
         
         if user_entry is None:
-            # New user - add to leaderboard
-            entry = {
-                "model_id": model_id,
-                "user_id": user_id,
-                "legal_rate": new_legal_rate,
-                "legal_rate_first_try": new_legal_rate_first_try,
-                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            }
-            leaderboard.append(entry)
+            leaderboard.append(new_entry)
             save_leaderboard(leaderboard)
             update_message = "New entry added to leaderboard!"
         else:
-            # Existing user - only update if this submission is better
-            old_legal_rate = user_entry.get("legal_rate", 0)
-            old_model = user_entry.get("model_id", "unknown")
-            if new_legal_rate > old_legal_rate:
-                user_entry.update({
-                    "model_id": model_id,  # Update to new model if better
-                    "legal_rate": new_legal_rate,
-                    "legal_rate_first_try": new_legal_rate_first_try,
-                    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+            old_rate = user_entry.get("legal_rate_with_retry", 0)
+            if result.legal_rate_with_retry > old_rate:
+                user_entry.update(new_entry)
                 save_leaderboard(leaderboard)
-                if old_model != model_id:
-                    update_message = f"🎉 Improved! New best model for {user_id}: {old_legal_rate*100:.1f}% → {new_legal_rate*100:.1f}%"
-                else:
-                    update_message = f"🎉 Improved! Previous: {old_legal_rate*100:.1f}% → New: {new_legal_rate*100:.1f}%"
+                update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate_with_retry*100:.1f}%"
             else:
-                update_message = f"ℹ️ No improvement. Your best: {old_legal_rate*100:.1f}% (model: {old_model.split('/')[-1]}), This run: {new_legal_rate*100:.1f}%"
+                update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate_with_retry*100:.1f}%"
+        
+        # Post discussion to model page
+        if HF_TOKEN:
+            try:
+                post_discussion_summary(model_id, result, HF_TOKEN)
+                discussion_message = "Results posted to model page"
+            except Exception as e:
+                discussion_message = f"Could not post to model page: {e}"
+        else:
+            discussion_message = "No HF_TOKEN - results not posted to model page"
         
         progress(1.0, desc="Done!")
         
-        # Format tokenizer info for display
-        tokenizer_debug = tokenizer_info.strip().replace("   ", "- ")
-        
-        return f"""
-## Legal Move Evaluation for {model_id.split('/')[-1]}
+        return f"""## Evaluation Complete
 
-| Metric | Value |
-|--------|-------|
-| **Positions Tested** | {results['total_positions']} |
-| **Legal (1st try)** | {results['legal_first_try']} ({results['legal_rate_first_try']*100:.1f}%) |
-| **Legal (with retries)** | {results['legal_first_try'] + results['legal_with_retry']} ({results['legal_rate_with_retry']*100:.1f}%) |
-| **Always Illegal** | {results['illegal_all_retries']} ({results['illegal_rate']*100:.1f}%) |
+{result.summary()}
 
-### Tokenizer Info
-```
-{tokenizer_debug}
-```
+---
 
 ### Leaderboard Update
 {update_message}
 
-### Interpretation
-- **>90% legal rate**: Great! Model has learned chess rules well.
-- **70-90% legal rate**: Decent, but room for improvement.
-- **<70% legal rate**: Model struggles with legal move generation.
+### Model Page Discussion
+{discussion_message}
 """
         
     except Exception as e:
-        return f"Evaluation failed: {str(e)}"
+        import traceback
+        return f"""## Evaluation Failed
 
+An unexpected error occurred:
 
-# def evaluate_winrate(
-#     model_id: str,
-#     stockfish_level: str,
-#     n_games: int,
-#     progress: gr.Progress = gr.Progress(),
-# ) -> str:
-#     """Evaluate a model's win rate against Stockfish."""
-#     try:
-#         import sys
-#         sys.path.insert(0, str(Path(__file__).parent))
-#         
-#         from src.evaluate import ChessEvaluator, load_model_from_hub
-#         
-#         progress(0, desc="Loading model...")
-#         model, tokenizer = load_model_from_hub(model_id)
-#         
-#         progress(0.1, desc="Setting up Stockfish...")
-#         level = STOCKFISH_LEVELS.get(stockfish_level, 1)
-#         evaluator = ChessEvaluator(
-#             model=model,
-#             tokenizer=tokenizer,
-#             stockfish_level=level,
-#         )
-#         
-#         progress(0.2, desc=f"Playing {n_games} games...")
-#         results = evaluator.evaluate(n_games=n_games, verbose=False)
-#         
-#         # Update leaderboard
-#         leaderboard = load_leaderboard()
-#         entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
-#         if entry is None:
-#             entry = {"model_id": model_id}
-#             leaderboard.append(entry)
-#         
-#         entry.update({
-#             "elo": results.get("estimated_elo", 1000),
-#             "win_rate": results.get("win_rate", 0),
-#             "games_played": entry.get("games_played", 0) + n_games,
-#             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-#         })
-#         
-#         save_leaderboard(leaderboard)
-#         progress(1.0, desc="Done!")
-#         
-#         return f"""
-# ## Win Rate Evaluation for {model_id.split('/')[-1]}
-# 
-# | Metric | Value |
-# |--------|-------|
-# | **Estimated ELO** | {results.get('estimated_elo', 'N/A'):.0f} |
-# | **Win Rate** | {results.get('win_rate', 0)*100:.1f}% |
-# | **Draw Rate** | {results.get('draw_rate', 0)*100:.1f}% |
-# | **Loss Rate** | {results.get('loss_rate', 0)*100:.1f}% |
-# | **Avg Game Length** | {results.get('avg_game_length', 0):.1f} moves |
-# | **Illegal Move Rate** | {results.get('illegal_move_rate', 0)*100:.2f}% |
-# 
-# Games played: {n_games} against Stockfish {stockfish_level}
-# """
-#         
-#     except Exception as e:
-#         return f"Evaluation failed: {str(e)}"
-
-
-# def evaluate_model(
-#     model_id: str,
-#     stockfish_level: str,
-#     n_games: int,
-#     progress: gr.Progress = gr.Progress(),
-# ) -> str:
-#     """Evaluate a model against Stockfish."""
-#     try:
-#         # Import evaluation code
-#         import sys
-#         sys.path.insert(0, str(Path(__file__).parent))
-#         
-#         from src.evaluate import ChessEvaluator, load_model_from_hub
-#         
-#         progress(0, desc="Loading model...")
-#         model, tokenizer = load_model_from_hub(model_id)
-#         
-#         progress(0.1, desc="Setting up Stockfish...")
-#         level = STOCKFISH_LEVELS.get(stockfish_level, 1)
-#         evaluator = ChessEvaluator(
-#             model=model,
-#             tokenizer=tokenizer,
-#             stockfish_level=level,
-#         )
-#         
-#         progress(0.2, desc=f"Playing {n_games} games...")
-#         results = evaluator.evaluate(n_games=n_games, verbose=False)
-#         
-#         # Update leaderboard
-#         leaderboard = load_leaderboard()
-#         
-#         # Find or create entry
-#         entry = next((e for e in leaderboard if e["model_id"] == model_id), None)
-#         if entry is None:
-#             entry = {"model_id": model_id}
-#             leaderboard.append(entry)
-#         
-#         entry.update({
-#             "elo": results.get("estimated_elo", 1000),
-#             "win_rate": results.get("win_rate", 0),
-#             "games_played": entry.get("games_played", 0) + n_games,
-#             "illegal_rate": results.get("illegal_move_rate", 0),
-#             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-#         })
-#         
-#         save_leaderboard(leaderboard)
-#         
-#         progress(1.0, desc="Done!")
-#         
-#         return f"""
-# ## Evaluation Results for {model_id.split('/')[-1]}
-# 
-# | Metric | Value |
-# |--------|-------|
-# | **Estimated ELO** | {results.get('estimated_elo', 'N/A'):.0f} |
-# | **Win Rate** | {results.get('win_rate', 0)*100:.1f}% |
-# | **Draw Rate** | {results.get('draw_rate', 0)*100:.1f}% |
-# | **Loss Rate** | {results.get('loss_rate', 0)*100:.1f}% |
-# | **Avg Game Length** | {results.get('avg_game_length', 0):.1f} moves |
-# | **Illegal Move Rate** | {results.get('illegal_move_rate', 0)*100:.2f}% |
-# 
-# Games played: {n_games} against Stockfish {stockfish_level}
-# """
-#         
-#     except Exception as e:
-#         return f"Evaluation failed: {str(e)}"
+```
+{traceback.format_exc()}
+```
+"""
 
 
 def refresh_leaderboard() -> str:
@@ -618,7 +534,10 @@ def refresh_leaderboard() -> str:
     return format_leaderboard_html(load_leaderboard())
 
 
-# Build Gradio Interface
+# =============================================================================
+# Gradio Interface
+# =============================================================================
+
 with gr.Blocks(
     title="Play Chess like a Honey Bee",
     theme=gr.themes.Soft(),
@@ -633,177 +552,207 @@ with gr.Blocks(
     """)
     
     with gr.Tabs():
-        # Submission Guide Tab
-        with gr.TabItem("How to Submit"):
+        # How to Submit Tab
+        with gr.TabItem("📖 How to Submit"):
             gr.Markdown(f"""
             ### Submitting Your Model
                         
-            The goal is to create a chess-playing language model with **under 1 million parameters**, which is roughly the number of neurons in a honey bee's brain.
-            At this scale, efficiency and clever architecture choices are key! We are not targetting superhuman performance, but rather exploring how well small models can learn the rules of chess, the goal being (only) to play **legal moves**.
+            The goal is to create a chess-playing language model with **under 1 million parameters**, 
+            which is roughly the number of neurons in a honey bee's brain.
             
-            0. **Clone this repository**: 
+            At this scale, efficiency and clever architecture choices are key! We are not targeting 
+            superhuman performance, but rather exploring how well small models can learn the rules 
+            of chess. The goal is to play **legal moves**.
+            
+            ---
+            
+            ### Getting Started
+            
+            1. **Clone this repository**: 
                 ```bash
                 git clone https://huggingface.co/spaces/LLM-course/Chess1MChallenge
                 ```
-                and check the `TEMPLATE_README.md` for detailed instructions.
-                        
-            1. **Train your model**
+                
+            2. **Check the example solution** in the `example_solution/` folder for reference
             
-            2. **Push to Hugging Face Hub** using the `submit.py` script provided in the template to make sure that your model is registered correctly.
+            3. **Train your model** using the provided training script or your own approach
             
-            3. **Verify your submission** by checking the model page on Hugging Face
+            4. **Submit using the official script**:
+                ```bash
+                python submit.py --model_path ./my_model --model_name my-chess-model
+                ```
             
-            4. **Run evaluations**:            
+            5. **Run evaluation** on this page to see your results on the leaderboard
+            
+            ---
+            
+            ### Evaluation Procedure
+            
+            Your model will be evaluated as follows:
+            
+            1. **Parameter check**: Must have < 1M parameters
+            2. **Security check**: Model cannot use python-chess to filter legal moves
+            3. **Game play**: 500 moves against opponent engine (games restart every 25 moves)
+            4. **Move generation**: 3 retries allowed per move, greedy decoding
+            5. **Scoring**: Legal move rate (first try and with retries)
+            
+            The evaluation is **fully deterministic** (seeded randomness, deterministic opponent).
+            
+            ---
+            
             ### Requirements
             
             - Model must be under **1M parameters**
-            - Model must use the `ChessConfig` and `ChessForCausalLM` classes
+            - Model must use the `ChessConfig` and `ChessForCausalLM` classes (or compatible)
             - Include the tokenizer with your submission
+            - **Do not** use python-chess to filter moves during generation
             
             ### Tips for Better Performance
             
             - Experiment with different architectures (layers, heads, dimensions)
             - Try weight tying to save parameters
+            - Focus on learning the rules of chess, not just memorizing openings
+            - Check the `example_solution/` folder for ideas
             """)
         
-        # Interactive Demo Tab (commented out for now)
-        # with gr.TabItem("🎮 Interactive Demo"):
-        #     gr.Markdown("### Test a Model")
-        #     
-        #     with gr.Row():
-        #         with gr.Column(scale=1):
-        #             with gr.Row():
-        #                 model_dropdown = gr.Dropdown(
-        #                     choices=get_available_models(),
-        #                     label="Select Model",
-        #                     value=None,
-        #                     scale=4,
-        #                 )
-        #                 refresh_models_btn = gr.Button("🔄", scale=1)
-        #             temperature_slider = gr.Slider(
-        #                 minimum=0.1,
-        #                 maximum=2.0,
-        #                 value=0.7,
-        #                 step=0.1,
-        #                 label="Temperature",
-        #             )
-        #             
-        #             with gr.Row():
-        #                 play_btn = gr.Button("Model Move", variant="primary")
-        #                 reset_btn = gr.Button("Reset")
-        #             
-        #             status_text = gr.Textbox(label="Status", interactive=False)
-        #         
-        #         with gr.Column(scale=1):
-        #             board_display = gr.HTML(value=render_board_svg())
-        #     
-        #     # Hidden state
-        #     current_fen = gr.State("startpos")
-        #     move_history = gr.State("")
-        #     
-        #     def refresh_models():
-        #         return gr.update(choices=get_available_models())
-        #     
-        #     refresh_models_btn.click(
-        #         refresh_models,
-        #         outputs=[model_dropdown],
-        #     )
-        #     
-        #     play_btn.click(
-        #         play_move,
-        #         inputs=[model_dropdown, current_fen, move_history, temperature_slider],
-        #         outputs=[board_display, current_fen, move_history, status_text],
-        #     )
-        #     
-        #     def reset_game():
-        #         return render_board_svg(), "startpos", "", "Game reset!"
-        #     
-        #     reset_btn.click(
-        #         reset_game,
-        #         outputs=[board_display, current_fen, move_history, status_text],
-        #     )
-        
-        # Legal Move Evaluation Tab
-        with gr.TabItem("Legal Move Eval"):
+        # Evaluation Tab
+        with gr.TabItem("Evaluate Model"):
             gr.Markdown("""
-            ### Phase 1: Legal Move Evaluation
+            ### Run Evaluation
             
-            Test if your model can generate **legal chess moves** in random positions.
-            
-            - Tests the model on random board positions
-            - Measures how often it generates legal moves
+            Select a model to evaluate. The evaluation will:
+            - Check parameter count (< 1M required)
+            - Verify no illegal python-chess usage
+            - Play 500 moves against opponent engine
+            - Track legal move rates
+            - Update the leaderboard (if improvement)
+            - Post results to the model's discussion page
             """)
             
             with gr.Row():
-                legal_model = gr.Dropdown(
+                model_dropdown = gr.Dropdown(
                     choices=get_available_models(),
                     label="Model to Evaluate",
+                    scale=4,
                 )
-                refresh_legal_models_btn = gr.Button("🔄", scale=0, min_width=40)
+                refresh_models_btn = gr.Button("Refresh", scale=1, min_width=50)
             
-            def refresh_legal_models():
+            def refresh_models():
                 return gr.update(choices=get_available_models())
             
-            refresh_legal_models_btn.click(
-                refresh_legal_models,
-                outputs=[legal_model],
+            refresh_models_btn.click(
+                refresh_models,
+                outputs=[model_dropdown],
             )
             
-            legal_btn = gr.Button("Run Legal Move Evaluation", variant="primary")
-            legal_results = gr.Markdown()
+            eval_btn = gr.Button("Run Evaluation", variant="primary")
+            eval_results = gr.Markdown()
             
-            legal_btn.click(
-                evaluate_legal_moves,
-                inputs=[legal_model],
-                outputs=legal_results,
+            eval_btn.click(
+                run_evaluation,
+                inputs=[model_dropdown],
+                outputs=eval_results,
             )
         
-        # Win Rate Evaluation Tab (commented out for now)
-        # with gr.TabItem("🏆 Win Rate Eval"):
-        #     gr.Markdown("""
-        #     ### Phase 2: Win Rate Evaluation
-        #     
-        #     Play full games against Stockfish and measure win rate.
-        #     This evaluation computes your model's **ELO rating**.
-        #     
-        #     - Plays complete games against Stockfish
-        #     - Measures win/draw/loss rates
-        #     - Estimates ELO rating
-        #     """)
-        #     
-        #     with gr.Row():
-        #         eval_model = gr.Dropdown(
-        #             choices=get_available_models(),
-        #             label="Model to Evaluate",
-        #         )
-        #         eval_level = gr.Dropdown(
-        #             choices=list(STOCKFISH_LEVELS.keys()),
-        #             value="Easy (Level 1)",
-        #             label="Stockfish Level",
-        #         )
-        #         eval_games = gr.Slider(
-        #             minimum=10,
-        #             maximum=100,
-        #             value=50,
-        #             step=10,
-        #             label="Number of Games",
-        #         )
-        #     
-        #     eval_btn = gr.Button("Run Win Rate Evaluation", variant="primary")
-        #     eval_results = gr.Markdown()
-        #     
-        #     eval_btn.click(
-        #         evaluate_winrate,
-        #         inputs=[eval_model, eval_level, eval_games],
-        #         outputs=eval_results,
-        #     )
-        
-        # Leaderboard Tab (moved to the end)
-        with gr.TabItem("🏆 Leaderboard"):
+        # Leaderboard Tab
+        with gr.TabItem("Leaderboard"):
             gr.Markdown("### Current Rankings")
+            gr.Markdown("""
+            Rankings are based on **legal move rate (with retries)**.
+            
+            - **Legal Rate (1st try)**: Percentage of moves that were legal on first attempt
+            - **Legal Rate (with retries)**: Percentage of moves that were legal within 3 attempts
+            """)
+            
             leaderboard_html = gr.HTML(value=format_leaderboard_html(load_leaderboard()))
             refresh_btn = gr.Button("Refresh Leaderboard")
             refresh_btn.click(refresh_leaderboard, outputs=leaderboard_html)
+
+
+# =============================================================================
+# Webhook Endpoint (mounted on Gradio's FastAPI app)
+# =============================================================================
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@demo.app.post("/webhook")
+async def handle_webhook(request: Request):
+    """
+    Handle HuggingFace webhook events for automatic model evaluation.
+    
+    Triggered on model creation and update events in the organization.
+    """
+    # Verify webhook signature
+    body = await request.body()
+    signature = request.headers.get("X-Webhook-Signature")
+    
+    if not verify_webhook_signature(body, signature):
+        print("[Webhook] Invalid signature")
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
+    
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    
+    event = payload.get("event", {})
+    repo = payload.get("repo", {})
+    
+    action = event.get("action")
+    scope = event.get("scope")
+    repo_type = repo.get("type")
+    repo_name = repo.get("name", "")
+    
+    print(f"[Webhook] Received: action={action}, scope={scope}, type={repo_type}, repo={repo_name}")
+    
+    # Only process model repos in our organization
+    if repo_type != "model":
+        return JSONResponse({"status": "ignored", "reason": "not a model"})
+    
+    if not repo_name.startswith(f"{ORGANIZATION}/"):
+        return JSONResponse({"status": "ignored", "reason": "not in organization"})
+    
+    # Only process create and update actions
+    if action not in ("create", "update"):
+        return JSONResponse({"status": "ignored", "reason": f"action {action} not handled"})
+    
+    # Check if it looks like a chess model
+    if not is_chess_model(repo_name):
+        return JSONResponse({"status": "ignored", "reason": "not a chess model"})
+    
+    # Check if already queued or running
+    with eval_lock:
+        current_status = eval_status.get(repo_name)
+        if current_status == "running":
+            return JSONResponse({"status": "ignored", "reason": "evaluation already running"})
+        if current_status == "queued":
+            return JSONResponse({"status": "ignored", "reason": "already in queue"})
+        eval_status[repo_name] = "queued"
+    
+    # Queue the model for evaluation
+    eval_queue.put(repo_name)
+    queue_size = eval_queue.qsize()
+    
+    print(f"[Webhook] Queued {repo_name} for evaluation (queue size: {queue_size})")
+    
+    return JSONResponse({
+        "status": "queued",
+        "model_id": repo_name,
+        "queue_position": queue_size,
+    })
+
+
+@demo.app.get("/webhook/status")
+async def webhook_status():
+    """Get the current status of the evaluation queue."""
+    with eval_lock:
+        status_copy = dict(eval_status)
+    
+    return JSONResponse({
+        "queue_size": eval_queue.qsize(),
+        "evaluations": status_copy,
+    })
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
-    "transformers>=4.40.0",
+    "transformers>=4.40.0,<5.0.0",
     "accelerate>=0.26.0",
     "datasets>=2.14.0",
     "python-chess>=1.999",
@@ -39,12 +39,8 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
-eval = [
-    "stockfish>=3.28.0",
-]
 
 [project.scripts]
-chess-train = "src.train:main"
 chess-eval = "src.evaluate:main"
 
 [tool.setuptools.packages.find]

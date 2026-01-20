@@ -1,6 +1,6 @@
 ---
 title: Chess Challenge Arena
-emoji: ♟️
+emoji: chess_pawn
 colorFrom: gray
 colorTo: yellow
 sdk: gradio
@@ -16,9 +16,3 @@ short_description: Play Chess like a Honey Bee
 This Space hosts the evaluation arena for the LLM Chess Challenge.
 
 **Chess Challenge Template**: https://github.com/nathanael-fijalkow/ChessChallengeTemplate
-
-## Features
-
-- **Interactive Demo**: Test any submitted model against Stockfish
-- **Leaderboard**: See rankings of all submitted models
-- **Statistics**: View detailed performance metrics

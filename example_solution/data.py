@@ -24,7 +24,7 @@ class ChessDataset(Dataset):
     The labels are shifted by one position for next-token prediction.
     
     Example:
-        >>> from src.tokenizer import ChessTokenizer
+        >>> from tokenizer import ChessTokenizer
         >>> tokenizer = ChessTokenizer.build_vocab_from_dataset()
         >>> dataset = ChessDataset(tokenizer, max_length=256)
         >>> sample = dataset[0]

@@ -22,10 +22,16 @@ from transformers import (
     set_seed,
 )
 
-from src.data import ChessDataCollator, create_train_val_datasets
-from src.model import ChessConfig, ChessForCausalLM
-from src.tokenizer import ChessTokenizer
-from src.utils import count_parameters, print_parameter_budget
+from data import ChessDataCollator, create_train_val_datasets
+from model import ChessConfig, ChessForCausalLM
+from tokenizer import ChessTokenizer
+
+
+def count_parameters(model, trainable_only=True):
+    """Count the number of parameters in a model."""
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
 
 
 def parse_args():
@@ -168,8 +174,13 @@ def main():
         eos_token_id=tokenizer.eos_token_id,
     )
     
-    # Print parameter budget
-    print_parameter_budget(config)
+    # Print configuration
+    print(f"\nModel configuration:")
+    print(f"  vocab_size: {config.vocab_size}")
+    print(f"  n_embd: {config.n_embd}")
+    print(f"  n_layer: {config.n_layer}")
+    print(f"  n_head: {config.n_head}")
+    print(f"  tie_weights: {config.tie_weights}")
     
     # Create model
     print("\nCreating model...")
@@ -180,7 +191,7 @@ def main():
     if n_params > 1_000_000:
         print("WARNING: Model exceeds 1M parameter limit!")
     else:
-        print("✓  Model is within 1M parameter limit")
+        print("OK: Model is within 1M parameter limit")
     
     # Load datasets
     print("\nLoading datasets...")
@@ -235,11 +246,44 @@ def main():
     
     # Save final model
     print("\nSaving final model...")
-    trainer.save_model(os.path.join(args.output_dir, "final_model"))
-    tokenizer.save_pretrained(os.path.join(args.output_dir, "final_model"))
+    final_model_dir = os.path.join(args.output_dir, "final_model")
+    trainer.save_model(final_model_dir)
+    tokenizer.save_pretrained(final_model_dir)
+    
+    # Copy model.py and tokenizer.py for trust_remote_code loading
+    import shutil
+    import json
+    script_dir = Path(__file__).parent
+    shutil.copy(script_dir / "model.py", final_model_dir)
+    shutil.copy(script_dir / "tokenizer.py", final_model_dir)
+    print("   Copied model.py and tokenizer.py")
+    
+    # Add auto_map to config.json for AutoModelForCausalLM
+    config_path = os.path.join(final_model_dir, "config.json")
+    with open(config_path) as f:
+        config_dict = json.load(f)
+    config_dict["auto_map"] = {
+        "AutoConfig": "model.ChessConfig",
+        "AutoModelForCausalLM": "model.ChessForCausalLM",
+    }
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+    print("   Added auto_map to config.json")
+    
+    # Add auto_map to tokenizer_config.json for AutoTokenizer
+    tokenizer_config_path = os.path.join(final_model_dir, "tokenizer_config.json")
+    with open(tokenizer_config_path) as f:
+        tokenizer_dict = json.load(f)
+    tokenizer_dict["auto_map"] = {
+        "AutoTokenizer": ["tokenizer.ChessTokenizer", None],
+    }
+    with open(tokenizer_config_path, "w") as f:
+        json.dump(tokenizer_dict, f, indent=2)
+    print("   Added auto_map to tokenizer_config.json")
     
     print("\nTraining complete!")
-    print(f"   Model saved to: {args.output_dir}/final_model")
+    print(f"   Model saved to: {final_model_dir}")
+    print("   Ready for submission with: python submit.py --model_path " + final_model_dir)
 
 
 if __name__ == "__main__":
