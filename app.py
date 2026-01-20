@@ -524,8 +524,9 @@ with gr.Blocks(
             """)
             
             with gr.Row():
-                model_dropdown = gr.ComboBox(
+                model_dropdown = gr.Dropdown(
                     choices=get_available_models(),
+                    allow_custom_value=True,
                     label="Model to Evaluate",
                     scale=4,
                 )
