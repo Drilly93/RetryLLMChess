@@ -101,7 +101,7 @@ def save_leaderboard(data: list):
             path_in_repo=LEADERBOARD_FILENAME,
             repo_id=LEADERBOARD_DATASET,
             repo_type="dataset",
-            commit_message=f"Update leaderboard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            commit_message=f"Update leaderboard - {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
         )
         print(f"Leaderboard saved to {LEADERBOARD_DATASET}")
         
@@ -290,8 +290,8 @@ def run_evaluation(
             model_info = hf_model_info(model_id, token=HF_TOKEN)
             model_last_modified = model_info.lastModified
         except Exception as e:
-            return f"## Evaluation Failed \
-Could not fetch model info for `{model_id}`: {e}"
+            return f"""## Evaluation Failed
+Could not fetch model info for `{model_id}`: {e}"""
 
         leaderboard = load_leaderboard()
         model_entry = next((e for e in leaderboard if e.get("model_id") == model_id), None)
@@ -399,13 +399,12 @@ which adds the required metadata to the README.md file.
             update_message = "New entry added to leaderboard!"
         else:
             old_rate = model_entry.get("legal_rate", 0)
-            model_entry.update(new_entry) # Update existing entry for the model
+            model_entry.update(new_entry)  # Update existing entry for the model
             save_leaderboard(leaderboard)
             if result.legal_rate_with_retry > old_rate:
                 update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate_with_retry*100:.1f}%"
             else:
                 update_message = f"Re-evaluated. Previous: {old_rate*100:.1f}%, This run: {result.legal_rate_with_retry*100:.1f}%"
-        update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate*100:.1f}%"
         
         # Post discussion to model page
         if HF_TOKEN:
