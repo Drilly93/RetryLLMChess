@@ -366,10 +366,8 @@ which adds the required metadata to the README.md file.
         new_entry = {
             "model_id": model_id,
             "user_id": user_id,
-            "n_parameters": result.n_parameters,
-            "legal_rate_first_try": result.legal_rate_first_try,
             "legal_rate": result.legal_rate,
-            "games_played": result.games_played,
+            "legal_rate_first_try": result.legal_rate_first_try,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         
@@ -467,9 +465,13 @@ with gr.Blocks(
                 git clone https://huggingface.co/spaces/LLM-course/Chess1MChallenge
                 ```
                 
-            2. **Check the example solution** in the `example_solution/` folder for reference
+            2. **Check an example solution** in the `example_solution/` folder for reference
             
-            3. **Train your model** using the provided training script or your own approach
+            3. **Train your model** using the provided training script or your own approach, and evaluate it locally:
+                ```bash
+                python -m src --model ./my_model
+                ```
+            
             
             4. **Submit using the official script**:
                 ```bash
@@ -562,92 +564,6 @@ with gr.Blocks(
             leaderboard_html = gr.HTML(value=format_leaderboard_html(load_leaderboard()))
             refresh_btn = gr.Button("Refresh Leaderboard")
             refresh_btn.click(refresh_leaderboard, outputs=leaderboard_html)
-
-
-# =============================================================================
-# Webhook Endpoint (mounted on Gradio's FastAPI app)
-# =============================================================================
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
-@demo.app.post("/webhook")
-async def handle_webhook(request: Request):
-    """
-    Handle HuggingFace webhook events for automatic model evaluation.
-    
-    Triggered on model creation and update events in the organization.
-    """
-    # Verify webhook signature
-    body = await request.body()
-    signature = request.headers.get("X-Webhook-Signature")
-    
-    if not verify_webhook_signature(body, signature):
-        print("[Webhook] Invalid signature")
-        return JSONResponse({"error": "Invalid signature"}, status_code=401)
-    
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    
-    event = payload.get("event", {})
-    repo = payload.get("repo", {})
-    
-    action = event.get("action")
-    scope = event.get("scope")
-    repo_type = repo.get("type")
-    repo_name = repo.get("name", "")
-    
-    print(f"[Webhook] Received: action={action}, scope={scope}, type={repo_type}, repo={repo_name}")
-    
-    # Only process model repos in our organization
-    if repo_type != "model":
-        return JSONResponse({"status": "ignored", "reason": "not a model"})
-    
-    if not repo_name.startswith(f"{ORGANIZATION}/"):
-        return JSONResponse({"status": "ignored", "reason": "not in organization"})
-    
-    # Only process create and update actions
-    if action not in ("create", "update"):
-        return JSONResponse({"status": "ignored", "reason": f"action {action} not handled"})
-    
-    # Check if it looks like a chess model
-    if not is_chess_model(repo_name):
-        return JSONResponse({"status": "ignored", "reason": "not a chess model"})
-    
-    # Check if already queued or running
-    with eval_lock:
-        current_status = eval_status.get(repo_name)
-        if current_status == "running":
-            return JSONResponse({"status": "ignored", "reason": "evaluation already running"})
-        if current_status == "queued":
-            return JSONResponse({"status": "ignored", "reason": "already in queue"})
-        eval_status[repo_name] = "queued"
-    
-    # Queue the model for evaluation
-    eval_queue.put(repo_name)
-    queue_size = eval_queue.qsize()
-    
-    print(f"[Webhook] Queued {repo_name} for evaluation (queue size: {queue_size})")
-    
-    return JSONResponse({
-        "status": "queued",
-        "model_id": repo_name,
-        "queue_position": queue_size,
-    })
-
-
-@demo.app.get("/webhook/status")
-async def webhook_status():
-    """Get the current status of the evaluation queue."""
-    with eval_lock:
-        status_copy = dict(eval_status)
-    
-    return JSONResponse({
-        "queue_size": eval_queue.qsize(),
-        "evaluations": status_copy,
-    })
 
 
 if __name__ == "__main__":
