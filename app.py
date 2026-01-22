@@ -100,7 +100,7 @@ def save_leaderboard(data: list):
             path_or_fileobj=csv_buffer,
             path_in_repo=LEADERBOARD_FILENAME,
             repo_id=LEADERBOARD_DATASET,
-            repo_type="dataset",utc
+            repo_type="dataset",
             commit_message=f"Update leaderboard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         )
         print(f"Leaderboard saved to {LEADERBOARD_DATASET}")
