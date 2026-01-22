@@ -21,7 +21,7 @@ import os
 import queue
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -33,7 +33,6 @@ ORGANIZATION = os.environ.get("HF_ORGANIZATION", "LLM-course")
 LEADERBOARD_DATASET = os.environ.get("LEADERBOARD_DATASET", f"{ORGANIZATION}/chess-challenge-leaderboard")
 LEADERBOARD_FILENAME = "leaderboard.csv"
 HF_TOKEN = os.environ.get("HF_TOKEN")  # Required for private dataset access
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "459f4c2c6b0b4b6468e21f981103753d14219d4955f07ab457e100fee93cae66")
 
 # CSV columns for the leaderboard
 LEADERBOARD_COLUMNS = [
@@ -42,6 +41,7 @@ LEADERBOARD_COLUMNS = [
     "legal_rate",
     "legal_rate_first_try",
     "last_updated",
+    "model_last_modified",
 ]
 
 def is_chess_model(model_id: str) -> bool:
@@ -50,15 +50,6 @@ def is_chess_model(model_id: str) -> bool:
         return False
     model_name = model_id.split("/")[-1].lower()
     return "chess" in model_name
-
-
-def verify_webhook_signature(body: bytes, signature: str) -> bool:
-    """Verify the webhook signature using HMAC-SHA256."""
-    if not WEBHOOK_SECRET:
-        return True  # Skip verification if no secret configured
-    expected = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature or "", expected)
-
 
 # =============================================================================
 # Leaderboard Management
@@ -109,7 +100,7 @@ def save_leaderboard(data: list):
             path_or_fileobj=csv_buffer,
             path_in_repo=LEADERBOARD_FILENAME,
             repo_id=LEADERBOARD_DATASET,
-            repo_type="dataset",
+            repo_type="dataset",utc
             commit_message=f"Update leaderboard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         )
         print(f"Leaderboard saved to {LEADERBOARD_DATASET}")
@@ -286,13 +277,38 @@ def run_evaluation(
     5. Update leaderboard and post discussion
     """
     try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        
+
         from src.evaluate import (
             ChessEvaluator,
             load_model_and_tokenizer,
             post_discussion_summary,
         )
+        from huggingface_hub import model_info as hf_model_info
+
+        progress(0, desc="Getting model info...")
+        try:
+            model_info = hf_model_info(model_id, token=HF_TOKEN)
+            model_last_modified = model_info.lastModified
+        except Exception as e:
+            return f"## Evaluation Failed
+Could not fetch model info for `{model_id}`: {e}"
+
+        leaderboard = load_leaderboard()
+        model_entry = next((e for e in leaderboard if e.get("model_id") == model_id), None)
+
+        if model_entry and "last_updated" in model_entry and model_entry["last_updated"]:
+            last_evaluation_date = datetime.strptime(model_entry["last_updated"], "%Y-%m-%d %H:%M")
+            
+            # model_last_modified is timezone-aware, last_evaluation_date is naive.
+            # Compare them by making model_last_modified naive UTC.
+            if last_evaluation_date > model_last_modified.astimezone(timezone.utc).replace(tzinfo=None):
+                return f"""## Evaluation Skipped
+
+Model `{model_id}` was already evaluated on {last_evaluation_date.strftime('%Y-%m-%d %H:%M UTC')}
+which is after the model was last modified on {model_last_modified.strftime('%Y-%m-%d %H:%M UTC')}.
+
+No new evaluation is needed.
+"""
         
         progress(0, desc="Loading model...")
         
@@ -312,6 +328,11 @@ def run_evaluation(
         
         # Run evaluation
         result = evaluator.evaluate(verbose=True)
+
+        print("=" * 80)
+        print(f"Evaluation summary for {model_id}")
+        print(result.summary())
+        print("=" * 80)
         
         progress(0.9, desc="Updating leaderboard...")
         
@@ -360,29 +381,31 @@ which adds the required metadata to the README.md file.
         # Update leaderboard
         leaderboard = load_leaderboard()
         
-        # Find existing entry for this user
-        user_entry = next((e for e in leaderboard if e.get("user_id") == user_id), None)
+        # Find existing entry for this model
+        model_entry = next((e for e in leaderboard if e.get("model_id") == model_id), None)
         
         new_entry = {
             "model_id": model_id,
             "user_id": user_id,
-            "legal_rate": result.legal_rate,
+            "legal_rate": result.legal_rate_with_retry,
             "legal_rate_first_try": result.legal_rate_first_try,
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "last_updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "model_last_modified": model_last_modified.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
         }
         
-        if user_entry is None:
+        if model_entry is None:
             leaderboard.append(new_entry)
             save_leaderboard(leaderboard)
             update_message = "New entry added to leaderboard!"
         else:
-            old_rate = user_entry.get("legal_rate", 0)
-            if result.legal_rate > old_rate:
-                user_entry.update(new_entry)
-                save_leaderboard(leaderboard)
-                update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate*100:.1f}%"
+            old_rate = model_entry.get("legal_rate", 0)
+            model_entry.update(new_entry) # Update existing entry for the model
+            save_leaderboard(leaderboard)
+            if result.legal_rate_with_retry > old_rate:
+                update_message = f"Improved! {old_rate*100:.1f}% -> {result.legal_rate_with_retry*100:.1f}%"
             else:
-                update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate*100:.1f}%"
+                update_message = f"Re-evaluated. Previous: {old_rate*100:.1f}%, This run: {result.legal_rate_with_retry*100:.1f}%"
+        update_message = f"No improvement. Best: {old_rate*100:.1f}%, This run: {result.legal_rate*100:.1f}%"
         
         # Post discussion to model page
         if HF_TOKEN:
@@ -462,7 +485,7 @@ with gr.Blocks(
             
             1. **Clone this repository**: 
                 ```bash
-                git clone https://huggingface.co/spaces/LLM-course/Chess1MChallenge
+                git clone ssh://huggingface.co/spaces/LLM-course/Chess1MChallenge
                 ```
                 
             2. **Check an example solution** in the `example_solution/` folder for reference
