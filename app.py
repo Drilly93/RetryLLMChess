@@ -290,7 +290,7 @@ def run_evaluation(
             model_info = hf_model_info(model_id, token=HF_TOKEN)
             model_last_modified = model_info.lastModified
         except Exception as e:
-            return f"## Evaluation Failed
+            return f"## Evaluation Failed \
 Could not fetch model info for `{model_id}`: {e}"
 
         leaderboard = load_leaderboard()
